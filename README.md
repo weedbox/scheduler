@@ -61,6 +61,9 @@ func main() {
     if err := sched.Start(ctx); err != nil {
         panic(err)
     }
+    if err := sched.WaitUntilRunning(ctx); err != nil {
+        panic(err)
+    }
     defer sched.Stop(ctx)
 
     // Create a schedule (runs every 5 seconds)
@@ -118,6 +121,9 @@ func main() {
     if err := sched.Start(ctx); err != nil {
         panic(err)
     }
+    if err := sched.WaitUntilRunning(ctx); err != nil {
+        panic(err)
+    }
     defer sched.Stop(ctx)
 
     // Add your jobs...
@@ -133,6 +139,7 @@ The `Scheduler` is the main component that manages job execution.
 ```go
 type Scheduler interface {
     Start(ctx context.Context) error
+    WaitUntilRunning(ctx context.Context) error
     Stop(ctx context.Context) error
     AddJob(id string, schedule Schedule, metadata map[string]string) error
     RemoveJob(id string) error
@@ -141,6 +148,8 @@ type Scheduler interface {
     IsRunning() bool
 }
 ```
+
+Call `WaitUntilRunning` when another goroutine handles `Start`, or when you need to ensure initialization (storage loading, ticker setup, etc.) has completed before proceeding with dependent work.
 
 ### Job
 

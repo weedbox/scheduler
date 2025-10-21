@@ -17,6 +17,7 @@ type schedulerImpl struct {
 	ctx      context.Context
 	cancel   context.CancelFunc
 	stopCh   chan struct{}
+	startReady chan struct{}
 	ticker   *time.Ticker
 	interval time.Duration
 }
@@ -24,11 +25,12 @@ type schedulerImpl struct {
 // NewScheduler creates a new Scheduler instance
 func NewScheduler(storage Storage, handler JobHandler, codec ScheduleCodec) Scheduler {
 	return &schedulerImpl{
-		jobs:     make(map[string]*jobImpl),
-		storage:  storage,
-		handler:  handler,
-		codec:    codec,
-		interval: time.Second, // Default check interval
+		jobs:       make(map[string]*jobImpl),
+		storage:    storage,
+		handler:    handler,
+		codec:      codec,
+		interval:   time.Second, // Default check interval
+		startReady: make(chan struct{}),
 	}
 }
 
@@ -62,8 +64,11 @@ func (s *schedulerImpl) Start(ctx context.Context) error {
 	s.running = true
 	s.ticker = time.NewTicker(s.interval)
 
+	ready := s.startReady
 	// Start scheduler loop
 	go s.run()
+
+	close(ready)
 
 	return nil
 }
@@ -104,6 +109,7 @@ func (s *schedulerImpl) Stop(ctx context.Context) error {
 	}
 
 	s.running = false
+	s.startReady = make(chan struct{})
 	s.mu.Unlock()
 	return nil
 }
@@ -240,6 +246,28 @@ func (s *schedulerImpl) IsRunning() bool {
 	defer s.mu.RUnlock()
 
 	return s.running
+}
+
+// WaitUntilRunning blocks until the scheduler has completed its Start sequence or the context is done.
+func (s *schedulerImpl) WaitUntilRunning(ctx context.Context) error {
+	s.mu.RLock()
+	if s.running {
+		s.mu.RUnlock()
+		return nil
+	}
+	startReady := s.startReady
+	s.mu.RUnlock()
+
+	if startReady == nil {
+		return ErrSchedulerNotStarted
+	}
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-startReady:
+		return nil
+	}
 }
 
 // run is the main scheduler loop

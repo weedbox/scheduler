@@ -83,6 +83,44 @@ func TestSchedulerStartStop(t *testing.T) {
 	assert.Equal(t, ErrSchedulerNotStarted, err)
 }
 
+func TestSchedulerWaitUntilRunning(t *testing.T) {
+	ctx := context.Background()
+	scheduler, _ := newTestScheduler(nil)
+
+	// Wait without starting should respect context timeout
+	waitCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel()
+	err := scheduler.WaitUntilRunning(waitCtx)
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
+
+	// Start and ensure wait returns immediately
+	err = scheduler.Start(ctx)
+	require.NoError(t, err)
+	err = scheduler.WaitUntilRunning(ctx)
+	assert.NoError(t, err)
+
+	err = scheduler.Stop(ctx)
+	require.NoError(t, err)
+
+	// Wait while Start is invoked asynchronously
+	waitCtx, cancel = context.WithTimeout(ctx, time.Second)
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		errCh <- scheduler.Start(ctx)
+	}()
+
+	err = scheduler.WaitUntilRunning(waitCtx)
+	assert.NoError(t, err)
+
+	startErr := <-errCh
+	assert.NoError(t, startErr)
+
+	require.NoError(t, scheduler.Stop(ctx))
+}
+
 // TestSchedulerAddJob tests adding jobs to the scheduler
 func TestSchedulerAddJob(t *testing.T) {
 	ctx := context.Background()

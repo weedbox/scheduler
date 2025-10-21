@@ -119,6 +119,9 @@ type Scheduler interface {
 	// Start begins the scheduler execution
 	Start(ctx context.Context) error
 
+	// WaitUntilRunning blocks until the scheduler has fully started or the context is done
+	WaitUntilRunning(ctx context.Context) error
+
 	// Stop gracefully shuts down the scheduler
 	Stop(ctx context.Context) error
 
