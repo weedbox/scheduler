@@ -46,7 +46,15 @@ import (
 func main() {
     // Create scheduler with in-memory storage
     storage := scheduler.NewMemoryStorage()
-    sched := scheduler.NewScheduler(storage)
+    handler := func(ctx context.Context, event scheduler.JobEvent) error {
+        switch event.ID() {
+        case "my-job":
+            fmt.Println("Job executed at", time.Now())
+        }
+        return nil
+    }
+
+    sched := scheduler.NewScheduler(storage, handler, scheduler.NewBasicScheduleCodec())
 
     // Start the scheduler
     ctx := context.Background()
@@ -55,17 +63,14 @@ func main() {
     }
     defer sched.Stop(ctx)
 
-    // Define a job function
-    jobFunc := func(ctx context.Context) error {
-        fmt.Println("Job executed at", time.Now())
-        return nil
+    // Create a schedule (runs every 5 seconds)
+    schedule, err := scheduler.NewIntervalSchedule(5 * time.Second)
+    if err != nil {
+        panic(err)
     }
 
-    // Create a schedule (runs every 5 seconds)
-    schedule := &IntervalSchedule{interval: 5 * time.Second}
-
     // Add the job to scheduler
-    if err := sched.AddJob("my-job", schedule, jobFunc); err != nil {
+    if err := sched.AddJob("my-job", schedule, map[string]string{"type": "print"}); err != nil {
         panic(err)
     }
 
@@ -98,7 +103,15 @@ func main() {
 
     // Create scheduler with GORM storage
     storage := scheduler.NewGormStorage(db)
-    sched := scheduler.NewScheduler(storage)
+    handler := func(ctx context.Context, event scheduler.JobEvent) error {
+        switch event.Metadata()["task"] {
+        case "cleanup":
+            fmt.Println("Running cleanup at", time.Now())
+        }
+        return nil
+    }
+
+    sched := scheduler.NewScheduler(storage, handler, scheduler.NewBasicScheduleCodec())
 
     // Start the scheduler
     ctx := context.Background()
@@ -121,7 +134,7 @@ The `Scheduler` is the main component that manages job execution.
 type Scheduler interface {
     Start(ctx context.Context) error
     Stop(ctx context.Context) error
-    AddJob(id string, schedule Schedule, fn JobFunc) error
+    AddJob(id string, schedule Schedule, metadata map[string]string) error
     RemoveJob(id string) error
     GetJob(id string) (Job, error)
     ListJobs() []Job
@@ -136,12 +149,23 @@ A `Job` represents a scheduled task with its metadata.
 ```go
 type Job interface {
     ID() string
-    Execute(ctx context.Context) error
     NextRun() time.Time
     LastRun() time.Time
     IsRunning() bool
+    Metadata() map[string]string
 }
 ```
+
+### JobHandler
+
+A job handler is provided when creating the scheduler and receives every execution.
+
+```go
+type JobHandler func(ctx context.Context, event JobEvent) error
+```
+
+Inside the handler, use `event.ID()` (or `event.Name()`) and `event.Metadata()` to
+dispatch to the correct business logic.
 
 ### Schedule
 
@@ -152,6 +176,21 @@ type Schedule interface {
     Next(t time.Time) time.Time
 }
 ```
+
+### ScheduleCodec
+
+When persistence is enabled, a schedule codec serializes schedules into storage-friendly values and rehydrates them on restart.
+
+```go
+type ScheduleCodec interface {
+    Encode(schedule Schedule) (scheduleType string, scheduleConfig string, err error)
+    Decode(scheduleType string, scheduleConfig string) (Schedule, error)
+}
+
+codec := scheduler.NewBasicScheduleCodec()
+```
+
+The basic codec supports `IntervalSchedule`, `StartAtIntervalSchedule`, and `OnceSchedule`. Custom codecs can be supplied for additional schedule types.
 
 ### Storage
 
@@ -232,41 +271,29 @@ storage := scheduler.NewGormStorage(db)
 ### Example 1: Interval-Based Schedule
 
 ```go
-// IntervalSchedule runs a job at fixed intervals
-type IntervalSchedule struct {
-    interval time.Duration
+schedule, err := scheduler.NewIntervalSchedule(10 * time.Minute)
+if err != nil {
+    panic(err)
 }
 
-func (s *IntervalSchedule) Next(t time.Time) time.Time {
-    return t.Add(s.interval)
+metadata := map[string]string{"job_type": "backup"}
+if err := sched.AddJob("backup-job", schedule, metadata); err != nil {
+    panic(err)
 }
-
-// Usage
-schedule := &IntervalSchedule{interval: 10 * time.Minute}
-sched.AddJob("backup-job", schedule, backupFunc)
 ```
 
 ### Example 2: One-Time Schedule
 
 ```go
-// OnceSchedule runs a job only once at a specific time
-type OnceSchedule struct {
-    runTime time.Time
-    hasRun  bool
-}
-
-func (s *OnceSchedule) Next(t time.Time) time.Time {
-    if s.hasRun {
-        return time.Now().Add(100 * 365 * 24 * time.Hour) // Far future
-    }
-    s.hasRun = true
-    return s.runTime
-}
-
-// Usage
 runAt := time.Now().Add(1 * time.Hour)
-schedule := &OnceSchedule{runTime: runAt}
-sched.AddJob("one-time-task", schedule, taskFunc)
+schedule, err := scheduler.NewOnceSchedule(runAt)
+if err != nil {
+    panic(err)
+}
+
+if err := sched.AddJob("one-time-task", schedule, map[string]string{"task": "report"}); err != nil {
+    panic(err)
+}
 ```
 
 ### Example 3: Query Execution History
@@ -304,7 +331,11 @@ for _, exec := range executions {
 ### Example 4: Job with Error Handling
 
 ```go
-jobFunc := func(ctx context.Context) error {
+handler := func(ctx context.Context, event scheduler.JobEvent) error {
+    if event.ID() != "work-job" {
+        return nil
+    }
+
     // Do some work
     if err := doWork(); err != nil {
         // Error will be recorded in execution history
@@ -313,7 +344,23 @@ jobFunc := func(ctx context.Context) error {
     return nil
 }
 
-sched.AddJob("work-job", schedule, jobFunc)
+storage := scheduler.NewMemoryStorage()
+sched := scheduler.NewScheduler(storage, handler, scheduler.NewBasicScheduleCodec())
+
+ctx := context.Background()
+if err := sched.Start(ctx); err != nil {
+    panic(err)
+}
+defer sched.Stop(ctx)
+
+schedule, err := scheduler.NewIntervalSchedule(15 * time.Minute)
+if err != nil {
+    panic(err)
+}
+
+if err := sched.AddJob("work-job", schedule, map[string]string{"task": "worker"}); err != nil {
+    panic(err)
+}
 
 // Later, check for failed executions
 failedStatus := scheduler.JobStatusFailed
@@ -332,13 +379,34 @@ for _, exec := range failedExecutions {
 ```go
 func main() {
     storage := scheduler.NewMemoryStorage()
-    sched := scheduler.NewScheduler(storage)
+    runJob := func(ctx context.Context) error {
+        fmt.Println("Processing job1 at", time.Now())
+        return nil
+    }
+    handler := func(ctx context.Context, event scheduler.JobEvent) error {
+        switch event.ID() {
+        case "job1":
+            return runJob(ctx)
+        }
+        return nil
+    }
+
+    sched := scheduler.NewScheduler(storage, handler, scheduler.NewBasicScheduleCodec())
 
     ctx := context.Background()
-    sched.Start(ctx)
+    if err := sched.Start(ctx); err != nil {
+        panic(err)
+    }
 
     // Add jobs...
-    sched.AddJob("job1", schedule, jobFunc)
+    schedule, err := scheduler.NewIntervalSchedule(5 * time.Minute)
+    if err != nil {
+        panic(err)
+    }
+
+    if err := sched.AddJob("job1", schedule, map[string]string{"task": "worker"}); err != nil {
+        panic(err)
+    }
 
     // Handle shutdown signals
     sigChan := make(chan os.Signal, 1)
@@ -439,15 +507,15 @@ Gracefully stops the scheduler, waiting for running jobs to complete.
 
 #### AddJob
 ```go
-AddJob(id string, schedule Schedule, fn JobFunc) error
+AddJob(id string, schedule Schedule, metadata map[string]string) error
 ```
 Registers a new job with the scheduler.
 
 **Errors:**
 - `ErrEmptyJobID`: Job ID is empty
-- `ErrNilJobFunc`: Job function is nil
 - `ErrJobAlreadyExists`: Job with this ID already exists
 - `ErrInvalidInterval`: Schedule is nil
+- Additional errors returned by the configured `ScheduleCodec` or storage implementation
 
 #### RemoveJob
 ```go
@@ -633,11 +701,15 @@ type QueryOptions struct {
 var (
     ErrSchedulerNotStarted       = errors.New("scheduler not started")
     ErrSchedulerAlreadyStarted   = errors.New("scheduler already started")
+    ErrSchedulerStopped          = errors.New("scheduler stopped")
     ErrStorageNotInitialized     = errors.New("storage not initialized")
     ErrJobNotFound               = errors.New("job not found")
     ErrJobAlreadyExists          = errors.New("job already exists")
     ErrEmptyJobID                = errors.New("job ID cannot be empty")
-    ErrNilJobFunc                = errors.New("job function cannot be nil")
+    ErrInvalidInterval           = errors.New("invalid schedule interval")
+    ErrInvalidScheduleTime       = errors.New("invalid schedule time")
+    ErrInvalidScheduleConfig     = errors.New("invalid schedule configuration")
+    ErrHandlerNotDefined         = errors.New("scheduler handler not defined")
     ErrInvalidJobData            = errors.New("invalid job data")
     ErrJobDataNotFound           = errors.New("job data not found")
     ErrExecutionHistoryNotFound  = errors.New("execution history not found")
@@ -647,8 +719,8 @@ var (
 ### Error Handling Example
 
 ```go
-err := sched.AddJob("my-job", schedule, jobFunc)
-if err != nil {
+metadata := map[string]string{"task": "worker"}
+if err := sched.AddJob("my-job", schedule, metadata); err != nil {
     switch {
     case errors.Is(err, scheduler.ErrJobAlreadyExists):
         fmt.Println("Job already exists, skipping...")
@@ -702,22 +774,35 @@ go func() {
 
 ```go
 // Good: Reasonable interval
-schedule := &IntervalSchedule{interval: 5 * time.Minute}
+schedule, err := scheduler.NewIntervalSchedule(5 * time.Minute)
+if err != nil {
+    panic(err)
+}
 
 // Avoid: Too frequent, may cause performance issues
-schedule := &IntervalSchedule{interval: 100 * time.Millisecond}
+if _, err := scheduler.NewIntervalSchedule(100 * time.Millisecond); err != nil {
+    panic(err)
+}
 ```
 
 ### 6. Clean Up Old Executions
 
 ```go
-// Run cleanup daily
-cleanupSchedule := &IntervalSchedule{interval: 24 * time.Hour}
-cleanupFunc := func(ctx context.Context) error {
-    cutoff := time.Now().Add(-30 * 24 * time.Hour)
-    return storage.DeleteExecutions(ctx, "all-jobs", cutoff)
+cleanupSchedule, err := scheduler.NewIntervalSchedule(24 * time.Hour)
+if err != nil {
+    panic(err)
 }
-sched.AddJob("cleanup", cleanupSchedule, cleanupFunc)
+
+if err := sched.AddJob("cleanup", cleanupSchedule, map[string]string{"task": "cleanup"}); err != nil {
+    panic(err)
+}
+
+// Inside your handler:
+// switch event.ID() {
+// case "cleanup":
+//     cutoff := time.Now().Add(-30 * 24 * time.Hour)
+//     return storage.DeleteExecutions(ctx, "all-jobs", cutoff)
+// }
 ```
 
 ## Testing

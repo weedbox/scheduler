@@ -12,42 +12,48 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// Mock schedule implementations for testing
-
-// intervalSchedule runs at fixed intervals
-type intervalSchedule struct {
-	interval time.Duration
+type testHandlerState struct {
+	mu      sync.RWMutex
+	handler func(context.Context, JobEvent) error
 }
 
-func (s *intervalSchedule) Next(t time.Time) time.Time {
-	return t.Add(s.interval)
+func newTestHandlerState() *testHandlerState {
+	return &testHandlerState{}
 }
 
-// onceSchedule runs only once at a specific time
-type onceSchedule struct {
-	runTime time.Time
-	hasRun  bool
-}
-
-func (s *onceSchedule) Next(t time.Time) time.Time {
-	if s.hasRun {
-		// Return far future time to prevent re-execution
-		return time.Now().Add(100 * 365 * 24 * time.Hour)
+func (s *testHandlerState) Handler() JobHandler {
+	return func(ctx context.Context, event JobEvent) error {
+		s.mu.RLock()
+		fn := s.handler
+		s.mu.RUnlock()
+		if fn == nil {
+			return nil
+		}
+		return fn(ctx, event)
 	}
-	s.hasRun = true
-	return s.runTime
+}
+
+func (s *testHandlerState) SetJobFunc(fn func(context.Context, JobEvent) error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.handler = fn
+}
+
+func newTestScheduler(storage Storage) (Scheduler, *testHandlerState) {
+	state := newTestHandlerState()
+	return NewScheduler(storage, state.Handler(), NewBasicScheduleCodec()), state
 }
 
 // TestNewScheduler tests creating a new scheduler
 func TestNewScheduler(t *testing.T) {
 	// Test with storage
 	storage := NewMemoryStorage()
-	scheduler := NewScheduler(storage)
+	scheduler, _ := newTestScheduler(storage)
 	assert.NotNil(t, scheduler)
 	assert.False(t, scheduler.IsRunning())
 
 	// Test without storage
-	scheduler = NewScheduler(nil)
+	scheduler, _ = newTestScheduler(nil)
 	assert.NotNil(t, scheduler)
 	assert.False(t, scheduler.IsRunning())
 }
@@ -56,7 +62,7 @@ func TestNewScheduler(t *testing.T) {
 func TestSchedulerStartStop(t *testing.T) {
 	ctx := context.Background()
 	storage := NewMemoryStorage()
-	scheduler := NewScheduler(storage)
+	scheduler, _ := newTestScheduler(storage)
 
 	// Test start
 	err := scheduler.Start(ctx)
@@ -81,35 +87,36 @@ func TestSchedulerStartStop(t *testing.T) {
 func TestSchedulerAddJob(t *testing.T) {
 	ctx := context.Background()
 	storage := NewMemoryStorage()
-	scheduler := NewScheduler(storage)
+	scheduler, state := newTestScheduler(storage)
 	scheduler.Start(ctx)
 	defer scheduler.Stop(ctx)
 
-	schedule := &intervalSchedule{interval: 1 * time.Second}
+	schedule, err := NewIntervalSchedule(1 * time.Second)
+	require.NoError(t, err)
 	counter := int32(0)
-	jobFunc := func(ctx context.Context) error {
-		atomic.AddInt32(&counter, 1)
+	jobFunc := func(ctx context.Context, event JobEvent) error {
+		if event.ID() == "job1" {
+			atomic.AddInt32(&counter, 1)
+		}
 		return nil
 	}
 
 	// Test add job successfully
-	err := scheduler.AddJob("job1", schedule, jobFunc)
+	state.SetJobFunc(jobFunc)
+	err = scheduler.AddJob("job1", schedule, nil)
 	assert.NoError(t, err)
 
 	// Test add duplicate job
-	err = scheduler.AddJob("job1", schedule, jobFunc)
+	state.SetJobFunc(jobFunc)
+	err = scheduler.AddJob("job1", schedule, nil)
 	assert.Equal(t, ErrJobAlreadyExists, err)
 
 	// Test add job with empty ID
-	err = scheduler.AddJob("", schedule, jobFunc)
+	err = scheduler.AddJob("", schedule, nil)
 	assert.Equal(t, ErrEmptyJobID, err)
 
-	// Test add job with nil function
-	err = scheduler.AddJob("job2", schedule, nil)
-	assert.Equal(t, ErrNilJobFunc, err)
-
 	// Test add job with nil schedule
-	err = scheduler.AddJob("job2", nil, jobFunc)
+	err = scheduler.AddJob("job2", nil, nil)
 	assert.Equal(t, ErrInvalidInterval, err)
 }
 
@@ -117,17 +124,16 @@ func TestSchedulerAddJob(t *testing.T) {
 func TestSchedulerRemoveJob(t *testing.T) {
 	ctx := context.Background()
 	storage := NewMemoryStorage()
-	scheduler := NewScheduler(storage)
+	scheduler, state := newTestScheduler(storage)
 	scheduler.Start(ctx)
 	defer scheduler.Stop(ctx)
 
-	schedule := &intervalSchedule{interval: 1 * time.Second}
-	jobFunc := func(ctx context.Context) error {
-		return nil
-	}
+	schedule, err := NewIntervalSchedule(1 * time.Second)
+	require.NoError(t, err)
 
 	// Add a job
-	err := scheduler.AddJob("job1", schedule, jobFunc)
+	state.SetJobFunc(func(context.Context, JobEvent) error { return nil })
+	err = scheduler.AddJob("job1", schedule, nil)
 	assert.NoError(t, err)
 
 	// Remove the job
@@ -147,17 +153,16 @@ func TestSchedulerRemoveJob(t *testing.T) {
 func TestSchedulerGetJob(t *testing.T) {
 	ctx := context.Background()
 	storage := NewMemoryStorage()
-	scheduler := NewScheduler(storage)
+	scheduler, state := newTestScheduler(storage)
 	scheduler.Start(ctx)
 	defer scheduler.Stop(ctx)
 
-	schedule := &intervalSchedule{interval: 1 * time.Second}
-	jobFunc := func(ctx context.Context) error {
-		return nil
-	}
+	schedule, err := NewIntervalSchedule(1 * time.Second)
+	require.NoError(t, err)
 
 	// Add a job
-	err := scheduler.AddJob("job1", schedule, jobFunc)
+	state.SetJobFunc(func(context.Context, JobEvent) error { return nil })
+	err = scheduler.AddJob("job1", schedule, nil)
 	assert.NoError(t, err)
 
 	// Get the job
@@ -179,7 +184,7 @@ func TestSchedulerGetJob(t *testing.T) {
 func TestSchedulerListJobs(t *testing.T) {
 	ctx := context.Background()
 	storage := NewMemoryStorage()
-	scheduler := NewScheduler(storage)
+	scheduler, state := newTestScheduler(storage)
 	scheduler.Start(ctx)
 	defer scheduler.Stop(ctx)
 
@@ -188,13 +193,13 @@ func TestSchedulerListJobs(t *testing.T) {
 	assert.Empty(t, jobs)
 
 	// Add multiple jobs
-	schedule := &intervalSchedule{interval: 1 * time.Second}
-	jobFunc := func(ctx context.Context) error {
-		return nil
-	}
+	schedule, err := NewIntervalSchedule(1 * time.Second)
+	require.NoError(t, err)
 
+	state.SetJobFunc(func(context.Context, JobEvent) error { return nil })
 	for i := 1; i <= 3; i++ {
-		err := scheduler.AddJob(string(rune('A'+i-1)), schedule, jobFunc)
+		jobID := string(rune('A' + i - 1))
+		err = scheduler.AddJob(jobID, schedule, nil)
 		assert.NoError(t, err)
 	}
 
@@ -207,19 +212,24 @@ func TestSchedulerListJobs(t *testing.T) {
 func TestSchedulerJobExecution(t *testing.T) {
 	ctx := context.Background()
 	storage := NewMemoryStorage()
-	scheduler := NewScheduler(storage)
+	scheduler, state := newTestScheduler(storage)
 	scheduler.Start(ctx)
 	defer scheduler.Stop(ctx)
 
 	// Create a job that runs immediately
-	schedule := &onceSchedule{runTime: time.Now()}
+	runAt := time.Now().Add(100 * time.Millisecond)
+	schedule, err := NewOnceSchedule(runAt)
+	require.NoError(t, err)
 	counter := int32(0)
-	jobFunc := func(ctx context.Context) error {
-		atomic.AddInt32(&counter, 1)
+	jobFunc := func(ctx context.Context, event JobEvent) error {
+		if event.ID() == "job1" {
+			atomic.AddInt32(&counter, 1)
+		}
 		return nil
 	}
 
-	err := scheduler.AddJob("job1", schedule, jobFunc)
+	state.SetJobFunc(jobFunc)
+	err = scheduler.AddJob("job1", schedule, nil)
 	assert.NoError(t, err)
 
 	// Wait for job to execute
@@ -239,18 +249,24 @@ func TestSchedulerJobExecution(t *testing.T) {
 func TestSchedulerJobExecutionWithError(t *testing.T) {
 	ctx := context.Background()
 	storage := NewMemoryStorage()
-	scheduler := NewScheduler(storage)
+	scheduler, state := newTestScheduler(storage)
 	scheduler.Start(ctx)
 	defer scheduler.Stop(ctx)
 
 	// Create a job that fails
-	schedule := &onceSchedule{runTime: time.Now()}
+	runAt := time.Now().Add(100 * time.Millisecond)
+	schedule, err := NewOnceSchedule(runAt)
+	require.NoError(t, err)
 	expectedErr := errors.New("job failed")
-	jobFunc := func(ctx context.Context) error {
-		return expectedErr
+	jobFunc := func(ctx context.Context, event JobEvent) error {
+		if event.ID() == "job1" {
+			return expectedErr
+		}
+		return nil
 	}
 
-	err := scheduler.AddJob("job1", schedule, jobFunc)
+	state.SetJobFunc(jobFunc)
+	err = scheduler.AddJob("job1", schedule, nil)
 	assert.NoError(t, err)
 
 	// Wait for job to execute
@@ -268,19 +284,23 @@ func TestSchedulerJobExecutionWithError(t *testing.T) {
 func TestSchedulerIntervalExecution(t *testing.T) {
 	ctx := context.Background()
 	storage := NewMemoryStorage()
-	scheduler := NewScheduler(storage)
+	scheduler, state := newTestScheduler(storage)
 	scheduler.Start(ctx)
 	defer scheduler.Stop(ctx)
 
 	// Create a job that runs every 500ms
-	schedule := &intervalSchedule{interval: 500 * time.Millisecond}
+	schedule, err := NewIntervalSchedule(500 * time.Millisecond)
+	require.NoError(t, err)
 	counter := int32(0)
-	jobFunc := func(ctx context.Context) error {
-		atomic.AddInt32(&counter, 1)
+	jobFunc := func(ctx context.Context, event JobEvent) error {
+		if event.ID() == "job1" {
+			atomic.AddInt32(&counter, 1)
+		}
 		return nil
 	}
 
-	err := scheduler.AddJob("job1", schedule, jobFunc)
+	state.SetJobFunc(jobFunc)
+	err = scheduler.AddJob("job1", schedule, nil)
 	assert.NoError(t, err)
 
 	// Wait for multiple executions
@@ -295,16 +315,19 @@ func TestSchedulerIntervalExecution(t *testing.T) {
 func TestSchedulerStoragePersistence(t *testing.T) {
 	ctx := context.Background()
 	storage := NewMemoryStorage()
-	scheduler := NewScheduler(storage)
+	scheduler, state := newTestScheduler(storage)
 	scheduler.Start(ctx)
 
-	schedule := &onceSchedule{runTime: time.Now()}
-	jobFunc := func(ctx context.Context) error {
+	runAt := time.Now().Add(100 * time.Millisecond)
+	schedule, err := NewOnceSchedule(runAt)
+	require.NoError(t, err)
+	jobFunc := func(ctx context.Context, event JobEvent) error {
 		return nil
 	}
 
 	// Add a job
-	err := scheduler.AddJob("job1", schedule, jobFunc)
+	state.SetJobFunc(jobFunc)
+	err = scheduler.AddJob("job1", schedule, nil)
 	assert.NoError(t, err)
 
 	// Wait for execution
@@ -329,27 +352,44 @@ func TestSchedulerStoragePersistence(t *testing.T) {
 func TestSchedulerConcurrentJobExecution(t *testing.T) {
 	ctx := context.Background()
 	storage := NewMemoryStorage()
-	scheduler := NewScheduler(storage)
+	scheduler, state := newTestScheduler(storage)
 	scheduler.Start(ctx)
 	defer scheduler.Stop(ctx)
 
 	// Create multiple jobs that run concurrently
 	var wg sync.WaitGroup
 	counter := int32(0)
+	handlerMu := sync.RWMutex{}
+	jobHandlers := make(map[string]func(context.Context, JobEvent) error)
+
+	state.SetJobFunc(func(ctx context.Context, event JobEvent) error {
+		handlerMu.RLock()
+		fn := jobHandlers[event.ID()]
+		handlerMu.RUnlock()
+		if fn == nil {
+			return nil
+		}
+		return fn(ctx, event)
+	})
 
 	for i := 0; i < 5; i++ {
 		wg.Add(1)
 		jobID := string(rune('A' + i))
 		// Each job needs its own schedule instance
-		schedule := &onceSchedule{runTime: time.Now()}
-		jobFunc := func(ctx context.Context) error {
+		runAt := time.Now().Add(100 * time.Millisecond)
+		schedule, err := NewOnceSchedule(runAt)
+		require.NoError(t, err)
+		jobFunc := func(ctx context.Context, event JobEvent) error {
 			defer wg.Done()
 			time.Sleep(100 * time.Millisecond)
 			atomic.AddInt32(&counter, 1)
 			return nil
 		}
 
-		err := scheduler.AddJob(jobID, schedule, jobFunc)
+		handlerMu.Lock()
+		jobHandlers[jobID] = jobFunc
+		handlerMu.Unlock()
+		err = scheduler.AddJob(jobID, schedule, nil)
 		assert.NoError(t, err)
 	}
 
@@ -375,20 +415,26 @@ func TestSchedulerConcurrentJobExecution(t *testing.T) {
 func TestSchedulerRemoveRunningJob(t *testing.T) {
 	ctx := context.Background()
 	storage := NewMemoryStorage()
-	scheduler := NewScheduler(storage)
+	scheduler, state := newTestScheduler(storage)
 	scheduler.Start(ctx)
 	defer scheduler.Stop(ctx)
 
 	// Create a job that takes some time to execute
-	schedule := &onceSchedule{runTime: time.Now()}
+	runAt := time.Now().Add(100 * time.Millisecond)
+	schedule, err := NewOnceSchedule(runAt)
+	require.NoError(t, err)
 	started := make(chan bool, 1)
-	jobFunc := func(ctx context.Context) error {
+	jobFunc := func(ctx context.Context, event JobEvent) error {
+		if event.ID() != "job1" {
+			return nil
+		}
 		started <- true
 		time.Sleep(1 * time.Second)
 		return nil
 	}
 
-	err := scheduler.AddJob("job1", schedule, jobFunc)
+	state.SetJobFunc(jobFunc)
+	err = scheduler.AddJob("job1", schedule, nil)
 	assert.NoError(t, err)
 
 	// Wait for job to start
@@ -419,21 +465,27 @@ func TestSchedulerRemoveRunningJob(t *testing.T) {
 func TestSchedulerGracefulShutdown(t *testing.T) {
 	ctx := context.Background()
 	storage := NewMemoryStorage()
-	scheduler := NewScheduler(storage)
+	scheduler, state := newTestScheduler(storage)
 	scheduler.Start(ctx)
 
 	// Create a job that takes some time to execute
-	schedule := &onceSchedule{runTime: time.Now()}
+	runAt := time.Now().Add(100 * time.Millisecond)
+	schedule, err := NewOnceSchedule(runAt)
+	require.NoError(t, err)
 	started := make(chan bool, 1)
 	completed := int32(0)
-	jobFunc := func(ctx context.Context) error {
+	jobFunc := func(ctx context.Context, event JobEvent) error {
+		if event.ID() != "job1" {
+			return nil
+		}
 		started <- true
 		time.Sleep(1 * time.Second)
 		atomic.StoreInt32(&completed, 1)
 		return nil
 	}
 
-	err := scheduler.AddJob("job1", schedule, jobFunc)
+	state.SetJobFunc(jobFunc)
+	err = scheduler.AddJob("job1", schedule, nil)
 	assert.NoError(t, err)
 
 	// Wait for job to start
@@ -456,18 +508,16 @@ func TestSchedulerGracefulShutdown(t *testing.T) {
 func TestJobInterface(t *testing.T) {
 	ctx := context.Background()
 	storage := NewMemoryStorage()
-	scheduler := NewScheduler(storage)
+	scheduler, state := newTestScheduler(storage)
 	scheduler.Start(ctx)
 	defer scheduler.Stop(ctx)
 
-	schedule := &intervalSchedule{interval: 1 * time.Hour}
-	executed := false
-	jobFunc := func(ctx context.Context) error {
-		executed = true
-		return nil
-	}
+	schedule, err := NewIntervalSchedule(1 * time.Hour)
+	require.NoError(t, err)
+	state.SetJobFunc(func(context.Context, JobEvent) error { return nil })
 
-	err := scheduler.AddJob("job1", schedule, jobFunc)
+	metadata := map[string]string{"env": "test"}
+	err = scheduler.AddJob("job1", schedule, metadata)
 	assert.NoError(t, err)
 
 	job, err := scheduler.GetJob("job1")
@@ -487,29 +537,37 @@ func TestJobInterface(t *testing.T) {
 	// Test IsRunning (should be false)
 	assert.False(t, job.IsRunning())
 
-	// Test Execute
-	err = job.Execute(ctx)
-	assert.NoError(t, err)
-	assert.True(t, executed)
+	// Test Metadata copy
+	meta := job.Metadata()
+	assert.Equal(t, "test", meta["env"])
+	meta["env"] = "mutated"
+
+	// Ensure original metadata is unchanged
+	meta2 := job.Metadata()
+	assert.Equal(t, "test", meta2["env"])
 }
 
 // TestSchedulerWithNilStorage tests scheduler without storage
 func TestSchedulerWithNilStorage(t *testing.T) {
 	ctx := context.Background()
-	scheduler := NewScheduler(nil)
+	scheduler, state := newTestScheduler(nil)
 
 	err := scheduler.Start(ctx)
 	assert.NoError(t, err)
 	assert.True(t, scheduler.IsRunning())
 
-	schedule := &intervalSchedule{interval: 1 * time.Second}
+	schedule, err := NewIntervalSchedule(1 * time.Second)
+	require.NoError(t, err)
 	counter := int32(0)
-	jobFunc := func(ctx context.Context) error {
-		atomic.AddInt32(&counter, 1)
+	jobFunc := func(ctx context.Context, event JobEvent) error {
+		if event.ID() == "job1" {
+			atomic.AddInt32(&counter, 1)
+		}
 		return nil
 	}
 
-	err = scheduler.AddJob("job1", schedule, jobFunc)
+	state.SetJobFunc(jobFunc)
+	err = scheduler.AddJob("job1", schedule, nil)
 	assert.NoError(t, err)
 
 	jobs := scheduler.ListJobs()
@@ -523,18 +581,23 @@ func TestSchedulerWithNilStorage(t *testing.T) {
 func TestSchedulerExecutionRecordDetails(t *testing.T) {
 	ctx := context.Background()
 	storage := NewMemoryStorage()
-	scheduler := NewScheduler(storage)
+	scheduler, state := newTestScheduler(storage)
 	scheduler.Start(ctx)
 	defer scheduler.Stop(ctx)
 
-	schedule := &onceSchedule{runTime: time.Now()}
+	runAt := time.Now().Add(100 * time.Millisecond)
+	schedule, err := NewOnceSchedule(runAt)
+	require.NoError(t, err)
 	executionDuration := 100 * time.Millisecond
-	jobFunc := func(ctx context.Context) error {
-		time.Sleep(executionDuration)
+	jobFunc := func(ctx context.Context, event JobEvent) error {
+		if event.ID() == "job1" {
+			time.Sleep(executionDuration)
+		}
 		return nil
 	}
 
-	err := scheduler.AddJob("job1", schedule, jobFunc)
+	state.SetJobFunc(jobFunc)
+	err = scheduler.AddJob("job1", schedule, nil)
 	assert.NoError(t, err)
 
 	// Wait for execution to complete
@@ -559,15 +622,15 @@ func TestSchedulerExecutionRecordDetails(t *testing.T) {
 // TestSchedulerAddJobBeforeStart tests adding jobs before scheduler starts
 func TestSchedulerAddJobBeforeStart(t *testing.T) {
 	storage := NewMemoryStorage()
-	scheduler := NewScheduler(storage)
+	scheduler, state := newTestScheduler(storage)
 
-	schedule := &intervalSchedule{interval: 1 * time.Second}
-	jobFunc := func(ctx context.Context) error {
-		return nil
-	}
+	schedule, err := NewIntervalSchedule(1 * time.Second)
+	require.NoError(t, err)
+	jobFunc := func(ctx context.Context, event JobEvent) error { return nil }
 
 	// Add job before starting scheduler
-	err := scheduler.AddJob("job1", schedule, jobFunc)
+	state.SetJobFunc(jobFunc)
+	err = scheduler.AddJob("job1", schedule, nil)
 	assert.NoError(t, err)
 
 	// Verify job was added
@@ -591,7 +654,7 @@ func TestSchedulerAddJobBeforeStart(t *testing.T) {
 func TestSchedulerMultipleStartStopCycles(t *testing.T) {
 	ctx := context.Background()
 	storage := NewMemoryStorage()
-	scheduler := NewScheduler(storage)
+	scheduler, _ := newTestScheduler(storage)
 
 	for i := 0; i < 3; i++ {
 		err := scheduler.Start(ctx)

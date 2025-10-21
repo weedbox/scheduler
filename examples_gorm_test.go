@@ -68,7 +68,14 @@ func ExampleGormStorage_withScheduler() {
 
 	// Create GORM storage and scheduler
 	storage := scheduler.NewGormStorage(db)
-	sched := scheduler.NewScheduler(storage)
+	jobFuncs := make(map[string]func(context.Context) error)
+	handler := func(ctx context.Context, event scheduler.JobEvent) error {
+		if fn, ok := jobFuncs[event.ID()]; ok && fn != nil {
+			return fn(ctx)
+		}
+		return nil
+	}
+	sched := scheduler.NewScheduler(storage, handler, scheduler.NewBasicScheduleCodec())
 
 	// Start scheduler (this will initialize storage)
 	ctx := context.Background()

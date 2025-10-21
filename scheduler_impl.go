@@ -12,6 +12,8 @@ type schedulerImpl struct {
 	running  bool
 	jobs     map[string]*jobImpl
 	storage  Storage
+	handler  JobHandler
+	codec    ScheduleCodec
 	ctx      context.Context
 	cancel   context.CancelFunc
 	stopCh   chan struct{}
@@ -20,10 +22,12 @@ type schedulerImpl struct {
 }
 
 // NewScheduler creates a new Scheduler instance
-func NewScheduler(storage Storage) Scheduler {
+func NewScheduler(storage Storage, handler JobHandler, codec ScheduleCodec) Scheduler {
 	return &schedulerImpl{
 		jobs:     make(map[string]*jobImpl),
 		storage:  storage,
+		handler:  handler,
+		codec:    codec,
 		interval: time.Second, // Default check interval
 	}
 }
@@ -35,6 +39,10 @@ func (s *schedulerImpl) Start(ctx context.Context) error {
 
 	if s.running {
 		return ErrSchedulerAlreadyStarted
+	}
+
+	if s.handler == nil {
+		return ErrHandlerNotDefined
 	}
 
 	// Initialize storage if provided
@@ -101,13 +109,9 @@ func (s *schedulerImpl) Stop(ctx context.Context) error {
 }
 
 // AddJob registers a new job with the scheduler
-func (s *schedulerImpl) AddJob(id string, schedule Schedule, fn JobFunc) error {
+func (s *schedulerImpl) AddJob(id string, schedule Schedule, metadata map[string]string) error {
 	if id == "" {
 		return ErrEmptyJobID
-	}
-
-	if fn == nil {
-		return ErrNilJobFunc
 	}
 
 	if schedule == nil {
@@ -121,11 +125,22 @@ func (s *schedulerImpl) AddJob(id string, schedule Schedule, fn JobFunc) error {
 		return ErrJobAlreadyExists
 	}
 
+	var scheduleType string
+	var scheduleConfig string
+	var err error
+
+	if s.codec != nil {
+		scheduleType, scheduleConfig, err = s.codec.Encode(schedule)
+		if err != nil {
+			return err
+		}
+	}
+
 	now := time.Now()
 	job := &jobImpl{
 		id:       id,
 		schedule: schedule,
-		fn:       fn,
+		metadata: copyMetadata(metadata),
 		nextRun:  schedule.Next(now),
 		lastRun:  time.Time{},
 		running:  false,
@@ -142,8 +157,9 @@ func (s *schedulerImpl) AddJob(id string, schedule Schedule, fn JobFunc) error {
 			LastRun:        job.lastRun,
 			CreatedAt:      now,
 			UpdatedAt:      now,
-			ScheduleConfig: "", // Would need schedule serialization
-			Metadata:       make(map[string]string),
+			ScheduleType:   scheduleType,
+			ScheduleConfig: scheduleConfig,
+			Metadata:       copyMetadata(metadata),
 		}
 
 		if err := s.storage.SaveJob(s.ctx, jobData); err != nil {
@@ -272,20 +288,36 @@ func (s *schedulerImpl) executeJob(job *jobImpl) {
 
 	startTime := time.Now()
 	executionID := job.id + "_" + startTime.Format("20060102150405")
+	scheduleType, scheduleConfig, hasSchedule := s.encodeSchedule(job.schedule)
+
+	job.mu.RLock()
+	initialNextRun := job.nextRun
+	initialMetadata := copyMetadata(job.metadata)
+	job.mu.RUnlock()
 
 	// Update storage status to running
 	if s.storage != nil {
 		jobData := &JobData{
 			ID:        job.id,
 			Status:    JobStatusRunning,
+			NextRun:   initialNextRun,
 			LastRun:   startTime,
+			Metadata:  initialMetadata,
 			UpdatedAt: startTime,
+		}
+		if hasSchedule {
+			jobData.ScheduleType = scheduleType
+			jobData.ScheduleConfig = scheduleConfig
 		}
 		s.storage.UpdateJob(s.ctx, jobData)
 	}
 
 	// Execute job function
-	err := job.fn(s.ctx)
+	var err error
+	if s.handler != nil {
+		event := newJobEvent(job, initialMetadata)
+		err = s.handler(s.ctx, event)
+	}
 
 	endTime := time.Now()
 	duration := endTime.Sub(startTime)
@@ -315,17 +347,28 @@ func (s *schedulerImpl) executeJob(job *jobImpl) {
 			Duration:    duration,
 			Status:      status,
 			Error:       errorMsg,
-			Metadata:    make(map[string]string),
+			Metadata:    copyMetadata(job.metadata),
 		}
 		s.storage.SaveExecution(s.ctx, record)
+
+		job.mu.RLock()
+		updatedNextRun := job.nextRun
+		updatedMetadata := copyMetadata(job.metadata)
+		lastRun := job.lastRun
+		job.mu.RUnlock()
 
 		// Update job status
 		jobData := &JobData{
 			ID:        job.id,
 			Status:    status,
-			NextRun:   job.nextRun,
-			LastRun:   job.lastRun,
+			NextRun:   updatedNextRun,
+			LastRun:   lastRun,
+			Metadata:  updatedMetadata,
 			UpdatedAt: endTime,
+		}
+		if hasSchedule {
+			jobData.ScheduleType = scheduleType
+			jobData.ScheduleConfig = scheduleConfig
 		}
 		s.storage.UpdateJob(s.ctx, jobData)
 	}
@@ -338,19 +381,35 @@ func (s *schedulerImpl) loadJobsFromStorage(ctx context.Context) error {
 		return err
 	}
 
-	// Note: This is a simplified implementation
-	// In a real-world scenario, you would need to reconstruct
-	// the Schedule and JobFunc from the stored data
-	// This would require additional serialization/deserialization logic
-	for _, jobData := range jobDataList {
-		// Skip if job already exists
-		if _, exists := s.jobs[jobData.ID]; exists {
-			continue
-		}
+	// Note: This requires a schedule codec to reconstruct job schedules.
+	if s.codec != nil {
+		now := time.Now()
+		for _, jobData := range jobDataList {
+			if _, exists := s.jobs[jobData.ID]; exists {
+				continue
+			}
 
-		// This is where you would reconstruct the job from stored data
-		// For now, we just skip loaded jobs as we cannot reconstruct
-		// the JobFunc from storage
+			schedule, err := s.codec.Decode(jobData.ScheduleType, jobData.ScheduleConfig)
+			if err != nil {
+				continue
+			}
+
+			nextRun := jobData.NextRun
+			if nextRun.IsZero() {
+				nextRun = schedule.Next(now)
+			}
+
+			job := &jobImpl{
+				id:       jobData.ID,
+				schedule: schedule,
+				metadata: copyMetadata(jobData.Metadata),
+				nextRun:  nextRun,
+				lastRun:  jobData.LastRun,
+				running:  false,
+			}
+
+			s.jobs[jobData.ID] = job
+		}
 	}
 
 	return nil
@@ -382,7 +441,7 @@ type jobImpl struct {
 	mu       sync.RWMutex
 	id       string
 	schedule Schedule
-	fn       JobFunc
+	metadata map[string]string
 	nextRun  time.Time
 	lastRun  time.Time
 	running  bool
@@ -391,11 +450,6 @@ type jobImpl struct {
 // ID returns the unique identifier of the job
 func (j *jobImpl) ID() string {
 	return j.id
-}
-
-// Execute runs the job function
-func (j *jobImpl) Execute(ctx context.Context) error {
-	return j.fn(ctx)
 }
 
 // NextRun returns the next scheduled run time
@@ -420,4 +474,37 @@ func (j *jobImpl) IsRunning() bool {
 	defer j.mu.RUnlock()
 
 	return j.running
+}
+
+// Metadata returns the job metadata
+func (j *jobImpl) Metadata() map[string]string {
+	j.mu.RLock()
+	defer j.mu.RUnlock()
+
+	return copyMetadata(j.metadata)
+}
+
+func copyMetadata(src map[string]string) map[string]string {
+	if src == nil {
+		return nil
+	}
+
+	dst := make(map[string]string, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
+}
+
+func (s *schedulerImpl) encodeSchedule(schedule Schedule) (string, string, bool) {
+	if s.codec == nil || schedule == nil {
+		return "", "", false
+	}
+
+	scheduleType, scheduleConfig, err := s.codec.Encode(schedule)
+	if err != nil {
+		return "", "", false
+	}
+
+	return scheduleType, scheduleConfig, true
 }

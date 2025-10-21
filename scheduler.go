@@ -23,6 +23,12 @@ var (
 	// ErrInvalidCronExpression indicates an invalid cron expression
 	ErrInvalidCronExpression = errors.New("invalid cron expression")
 
+	// ErrInvalidScheduleTime indicates an invalid schedule time
+	ErrInvalidScheduleTime = errors.New("invalid schedule time")
+
+	// ErrInvalidScheduleConfig indicates an invalid serialized schedule configuration
+	ErrInvalidScheduleConfig = errors.New("invalid schedule configuration")
+
 	// ErrJobNotFound indicates the specified job does not exist
 	ErrJobNotFound = errors.New("job not found")
 
@@ -32,20 +38,14 @@ var (
 	// ErrEmptyJobID indicates the job ID cannot be empty
 	ErrEmptyJobID = errors.New("job ID cannot be empty")
 
-	// ErrNilJobFunc indicates the job function cannot be nil
-	ErrNilJobFunc = errors.New("job function cannot be nil")
+	// ErrHandlerNotDefined indicates the scheduler was created without a job handler
+	ErrHandlerNotDefined = errors.New("scheduler handler not defined")
 )
-
-// JobFunc represents a function that will be executed by the scheduler
-type JobFunc func(ctx context.Context) error
 
 // Job represents a scheduled job configuration
 type Job interface {
 	// ID returns the unique identifier of the job
 	ID() string
-
-	// Execute runs the job function
-	Execute(ctx context.Context) error
 
 	// NextRun returns the next scheduled run time
 	NextRun() time.Time
@@ -55,12 +55,63 @@ type Job interface {
 
 	// IsRunning returns whether the job is currently executing
 	IsRunning() bool
+
+	// Metadata returns the job metadata
+	Metadata() map[string]string
+}
+
+// JobEvent represents the context passed to a JobHandler when a job is executed.
+type JobEvent struct {
+	job      Job
+	metadata map[string]string
+}
+
+// Job returns the underlying Job instance for advanced inspection.
+func (e JobEvent) Job() Job {
+	return e.job
+}
+
+// ID returns the unique identifier of the job associated with this event.
+func (e JobEvent) ID() string {
+	if e.job == nil {
+		return ""
+	}
+	return e.job.ID()
+}
+
+// Name returns the job name (alias for ID) associated with this event.
+func (e JobEvent) Name() string {
+	return e.ID()
+}
+
+// Metadata returns a copy of the job metadata captured at execution time.
+func (e JobEvent) Metadata() map[string]string {
+	return copyMetadata(e.metadata)
+}
+
+// JobHandler handles job execution events.
+type JobHandler func(ctx context.Context, event JobEvent) error
+
+func newJobEvent(job Job, metadata map[string]string) JobEvent {
+	return JobEvent{
+		job:      job,
+		metadata: copyMetadata(metadata),
+	}
 }
 
 // Schedule defines the scheduling strategy for a job
 type Schedule interface {
 	// Next calculates the next run time based on the current time
 	Next(t time.Time) time.Time
+}
+
+// ScheduleCodec encodes and decodes schedules for persistence
+type ScheduleCodec interface {
+	// Encode converts a schedule into a serializable representation
+	Encode(schedule Schedule) (scheduleType string, scheduleConfig string, err error)
+
+	// Decode reconstructs a schedule from its serialized representation
+	Decode(scheduleType string, scheduleConfig string) (Schedule, error)
 }
 
 // Scheduler defines the interface for job scheduling operations
@@ -72,7 +123,7 @@ type Scheduler interface {
 	Stop(ctx context.Context) error
 
 	// AddJob registers a new job with the scheduler
-	AddJob(id string, schedule Schedule, fn JobFunc) error
+	AddJob(id string, schedule Schedule, metadata map[string]string) error
 
 	// RemoveJob removes a job from the scheduler
 	RemoveJob(id string) error

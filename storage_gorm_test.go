@@ -696,18 +696,27 @@ func TestGormStorageWithRealScheduler(t *testing.T) {
 
 	// Create storage for scheduler
 	schedulerStorage := NewGormStorage(db)
-	scheduler := NewScheduler(schedulerStorage)
+	jobFuncs := make(map[string]func(context.Context) error)
+	handler := func(ctx context.Context, event JobEvent) error {
+		if fn, ok := jobFuncs[event.ID()]; ok && fn != nil {
+			return fn(ctx)
+		}
+		return nil
+	}
+	scheduler := NewScheduler(schedulerStorage, handler, NewBasicScheduleCodec())
 	err := scheduler.Start(ctx)
 	assert.NoError(t, err)
 	assert.True(t, scheduler.IsRunning())
 
 	// Add a job
-	schedule := &intervalSchedule{interval: 1 * time.Second}
+	schedule, scheduleErr := NewIntervalSchedule(1 * time.Second)
+	require.NoError(t, scheduleErr)
 	jobFunc := func(ctx context.Context) error {
 		return nil
 	}
 
-	err = scheduler.AddJob("test-job", schedule, jobFunc)
+	jobFuncs["test-job"] = jobFunc
+	err = scheduler.AddJob("test-job", schedule, nil)
 	assert.NoError(t, err)
 
 	// Wait a bit for execution
