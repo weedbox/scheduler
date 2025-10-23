@@ -164,6 +164,9 @@ type Scheduler interface {
 	// AddJob registers a new job with the scheduler
 	AddJob(id string, schedule Schedule, metadata map[string]string) error
 
+	// UpdateJobSchedule replaces the schedule for an existing job
+	UpdateJobSchedule(id string, schedule Schedule) error
+
 	// RemoveJob removes a job from the scheduler
 	RemoveJob(id string) error
 

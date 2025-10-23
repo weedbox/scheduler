@@ -177,6 +177,85 @@ func (s *schedulerImpl) AddJob(id string, schedule Schedule, metadata map[string
 	return nil
 }
 
+// UpdateJobSchedule replaces the schedule of an existing job.
+func (s *schedulerImpl) UpdateJobSchedule(id string, schedule Schedule) error {
+	if id == "" {
+		return ErrEmptyJobID
+	}
+
+	if schedule == nil {
+		return ErrInvalidInterval
+	}
+
+	var scheduleType string
+	var scheduleConfig string
+	var err error
+
+	if s.codec != nil {
+		scheduleType, scheduleConfig, err = s.codec.Encode(schedule)
+		if err != nil {
+			return err
+		}
+	}
+
+	now := time.Now()
+	nextRun := schedule.Next(now)
+
+	s.mu.Lock()
+	job, exists := s.jobs[id]
+	if !exists {
+		s.mu.Unlock()
+		return ErrJobNotFound
+	}
+
+	for job.IsRunning() {
+		s.mu.Unlock()
+		time.Sleep(100 * time.Millisecond)
+		s.mu.Lock()
+		job, exists = s.jobs[id]
+		if !exists {
+			s.mu.Unlock()
+			return ErrJobNotFound
+		}
+	}
+
+	var (
+		oldSchedule = job.schedule
+		oldNextRun  = job.nextRun
+	)
+
+	job.mu.Lock()
+	job.schedule = schedule
+	job.nextRun = nextRun
+	metadata := copyMetadata(job.metadata)
+	lastRun := job.lastRun
+	job.mu.Unlock()
+	s.mu.Unlock()
+
+	if s.storage != nil && s.running {
+		jobData := &JobData{
+			ID:             id,
+			Status:         JobStatusPending,
+			NextRun:        nextRun,
+			LastRun:        lastRun,
+			Metadata:       metadata,
+			UpdatedAt:      now,
+			ScheduleType:   scheduleType,
+			ScheduleConfig: scheduleConfig,
+		}
+
+		if err := s.storage.UpdateJob(s.ctx, jobData); err != nil {
+			job.mu.Lock()
+			job.schedule = oldSchedule
+			job.nextRun = oldNextRun
+			job.mu.Unlock()
+			return err
+		}
+	}
+
+	return nil
+}
+
 // RemoveJob removes a job from the scheduler
 func (s *schedulerImpl) RemoveJob(id string) error {
 	if id == "" {

@@ -77,6 +77,16 @@ func main() {
         panic(err)
     }
 
+    // Update the schedule later without removing the job
+    startAt := time.Now().Add(1 * time.Minute)
+    updated, err := scheduler.NewStartAtIntervalSchedule(startAt, 5*time.Second)
+    if err != nil {
+        panic(err)
+    }
+    if err := sched.UpdateJobSchedule("my-job", updated); err != nil {
+        panic(err)
+    }
+
     // Keep running
     time.Sleep(30 * time.Second)
 }
@@ -142,6 +152,7 @@ type Scheduler interface {
     WaitUntilRunning(ctx context.Context) error
     Stop(ctx context.Context) error
     AddJob(id string, schedule Schedule, metadata map[string]string) error
+    UpdateJobSchedule(id string, schedule Schedule) error
     RemoveJob(id string) error
     GetJob(id string) (Job, error)
     ListJobs() []Job
@@ -150,6 +161,17 @@ type Scheduler interface {
 ```
 
 Call `WaitUntilRunning` when another goroutine handles `Start`, or when you need to ensure initialization (storage loading, ticker setup, etc.) has completed before proceeding with dependent work.
+
+Use `UpdateJobSchedule` to swap the schedule for an existing job without removing it:
+
+```go
+newSchedule, _ := scheduler.NewStartAtIntervalSchedule(time.Now().Add(5*time.Minute), 5*time.Minute)
+if err := sched.UpdateJobSchedule("my-job", newSchedule); err != nil {
+    // handle update failure
+}
+```
+
+Directly editing `ScheduleType` or `ScheduleConfig` in storage does not change the in-memory scheduler; always use `UpdateJobSchedule` (or remove/re-add) for runtime updates.
 
 ### Job
 

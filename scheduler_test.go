@@ -167,6 +167,49 @@ func TestJobEventProvidesScheduleInfo(t *testing.T) {
 	require.NoError(t, scheduler.Stop(ctx))
 }
 
+func TestUpdateJobSchedule(t *testing.T) {
+	ctx := context.Background()
+	storage := NewMemoryStorage()
+	scheduler, _ := newTestScheduler(storage)
+
+	require.NoError(t, scheduler.Start(ctx))
+	require.NoError(t, scheduler.WaitUntilRunning(ctx))
+	defer scheduler.Stop(ctx)
+
+	initialSchedule, err := NewIntervalSchedule(1 * time.Hour)
+	require.NoError(t, err)
+
+	require.NoError(t, scheduler.AddJob("job-update", initialSchedule, map[string]string{"key": "value"}))
+
+	target := time.Now().Add(2 * time.Minute).Round(time.Second)
+	newSchedule, err := NewOnceSchedule(target)
+	require.NoError(t, err)
+
+	require.NoError(t, scheduler.UpdateJobSchedule("job-update", newSchedule))
+
+	job, err := scheduler.GetJob("job-update")
+	require.NoError(t, err)
+	assert.WithinDuration(t, target, job.NextRun(), time.Second)
+
+	storedJob, err := storage.GetJob(ctx, "job-update")
+	require.NoError(t, err)
+	assert.Equal(t, JobStatusPending, storedJob.Status)
+	assert.Equal(t, "once", storedJob.ScheduleType)
+	assert.Equal(t, target.UTC().Format(time.RFC3339Nano), storedJob.ScheduleConfig)
+	assert.WithinDuration(t, target, storedJob.NextRun, time.Second)
+}
+
+func TestUpdateJobScheduleValidation(t *testing.T) {
+	scheduler, _ := newTestScheduler(nil)
+
+	assert.Equal(t, ErrEmptyJobID, scheduler.UpdateJobSchedule("", nil))
+	assert.Equal(t, ErrInvalidInterval, scheduler.UpdateJobSchedule("job", nil))
+
+	interval, err := NewIntervalSchedule(time.Minute)
+	require.NoError(t, err)
+	assert.Equal(t, ErrJobNotFound, scheduler.UpdateJobSchedule("missing", interval))
+}
+
 // TestSchedulerAddJob tests adding jobs to the scheduler
 func TestSchedulerAddJob(t *testing.T) {
 	ctx := context.Background()
