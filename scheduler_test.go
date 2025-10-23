@@ -121,6 +121,52 @@ func TestSchedulerWaitUntilRunning(t *testing.T) {
 	require.NoError(t, scheduler.Stop(ctx))
 }
 
+func TestJobEventProvidesScheduleInfo(t *testing.T) {
+	ctx := context.Background()
+	scheduler, state := newTestScheduler(nil)
+
+	schedule, err := NewIntervalSchedule(50 * time.Millisecond)
+	require.NoError(t, err)
+
+	eventCh := make(chan JobEvent, 1)
+	state.SetJobFunc(func(ctx context.Context, event JobEvent) error {
+		select {
+		case eventCh <- event:
+		default:
+		}
+		return nil
+	})
+
+	require.NoError(t, scheduler.Start(ctx))
+	require.NoError(t, scheduler.WaitUntilRunning(ctx))
+
+	metadata := map[string]string{"foo": "bar"}
+	require.NoError(t, scheduler.AddJob("job-info", schedule, metadata))
+
+	var event JobEvent
+	select {
+	case event = <-eventCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for job execution")
+	}
+
+	assert.Equal(t, "job-info", event.ID())
+	meta := event.Metadata()
+	assert.Equal(t, "bar", meta["foo"])
+	assert.False(t, event.ScheduledAt().IsZero())
+	assert.False(t, event.StartedAt().IsZero())
+	assert.False(t, event.StartedAt().Before(event.ScheduledAt()))
+	assert.True(t, event.Delay() >= 0)
+	assert.True(t, event.LastCompletedAt().IsZero())
+
+	if sched := event.Schedule(); assert.NotNil(t, sched) {
+		_, ok := sched.(*IntervalSchedule)
+		assert.True(t, ok)
+	}
+
+	require.NoError(t, scheduler.Stop(ctx))
+}
+
 // TestSchedulerAddJob tests adding jobs to the scheduler
 func TestSchedulerAddJob(t *testing.T) {
 	ctx := context.Background()

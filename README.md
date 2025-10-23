@@ -176,6 +176,12 @@ type JobHandler func(ctx context.Context, event JobEvent) error
 Inside the handler, use `event.ID()` (or `event.Name()`) and `event.Metadata()` to
 dispatch to the correct business logic.
 
+The `JobEvent` passed to the handler also includes rich scheduling context:
+- `event.Schedule()` returns the schedule instance when available (e.g. `*IntervalSchedule`).
+- `event.ScheduledAt()` is the intended execution time based on the schedule.
+- `event.StartedAt()` is when the handler was actually invoked, and `event.Delay()` is the difference.
+- `event.LastCompletedAt()` reports when the job last finished (zero value if it has never run).
+
 ### Schedule
 
 The `Schedule` interface defines when a job should run.

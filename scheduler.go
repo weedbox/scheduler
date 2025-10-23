@@ -62,8 +62,12 @@ type Job interface {
 
 // JobEvent represents the context passed to a JobHandler when a job is executed.
 type JobEvent struct {
-	job      Job
-	metadata map[string]string
+	job           Job
+	metadata      map[string]string
+	schedule      Schedule
+	scheduledAt   time.Time
+	startedAt     time.Time
+	lastCompleted time.Time
 }
 
 // Job returns the underlying Job instance for advanced inspection.
@@ -89,13 +93,45 @@ func (e JobEvent) Metadata() map[string]string {
 	return copyMetadata(e.metadata)
 }
 
+// Schedule returns the schedule associated with the job when it executed.
+func (e JobEvent) Schedule() Schedule {
+	return e.schedule
+}
+
+// ScheduledAt returns the time the job was scheduled to execute.
+func (e JobEvent) ScheduledAt() time.Time {
+	return e.scheduledAt
+}
+
+// StartedAt returns the actual time the job handler was invoked.
+func (e JobEvent) StartedAt() time.Time {
+	return e.startedAt
+}
+
+// LastCompletedAt returns the completion time of the previous successful execution, or zero if none.
+func (e JobEvent) LastCompletedAt() time.Time {
+	return e.lastCompleted
+}
+
+// Delay returns the duration between the scheduled time and the handler invocation.
+func (e JobEvent) Delay() time.Duration {
+	if e.scheduledAt.IsZero() || e.startedAt.IsZero() {
+		return 0
+	}
+	return e.startedAt.Sub(e.scheduledAt)
+}
+
 // JobHandler handles job execution events.
 type JobHandler func(ctx context.Context, event JobEvent) error
 
-func newJobEvent(job Job, metadata map[string]string) JobEvent {
+func newJobEvent(job Job, metadata map[string]string, schedule Schedule, scheduledAt, startedAt, lastCompleted time.Time) JobEvent {
 	return JobEvent{
-		job:      job,
-		metadata: copyMetadata(metadata),
+		job:           job,
+		metadata:      metadata,
+		schedule:      schedule,
+		scheduledAt:   scheduledAt,
+		startedAt:     startedAt,
+		lastCompleted: lastCompleted,
 	}
 }
 

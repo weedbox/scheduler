@@ -8,18 +8,18 @@ import (
 
 // schedulerImpl is the concrete implementation of the Scheduler interface
 type schedulerImpl struct {
-	mu       sync.RWMutex
-	running  bool
-	jobs     map[string]*jobImpl
-	storage  Storage
-	handler  JobHandler
-	codec    ScheduleCodec
-	ctx      context.Context
-	cancel   context.CancelFunc
-	stopCh   chan struct{}
+	mu         sync.RWMutex
+	running    bool
+	jobs       map[string]*jobImpl
+	storage    Storage
+	handler    JobHandler
+	codec      ScheduleCodec
+	ctx        context.Context
+	cancel     context.CancelFunc
+	stopCh     chan struct{}
 	startReady chan struct{}
-	ticker   *time.Ticker
-	interval time.Duration
+	ticker     *time.Ticker
+	interval   time.Duration
 }
 
 // NewScheduler creates a new Scheduler instance
@@ -321,6 +321,8 @@ func (s *schedulerImpl) executeJob(job *jobImpl) {
 	job.mu.RLock()
 	initialNextRun := job.nextRun
 	initialMetadata := copyMetadata(job.metadata)
+	lastCompleted := job.lastRun
+	currentSchedule := job.schedule
 	job.mu.RUnlock()
 
 	// Update storage status to running
@@ -343,7 +345,7 @@ func (s *schedulerImpl) executeJob(job *jobImpl) {
 	// Execute job function
 	var err error
 	if s.handler != nil {
-		event := newJobEvent(job, initialMetadata)
+		event := newJobEvent(job, initialMetadata, currentSchedule, initialNextRun, startTime, lastCompleted)
 		err = s.handler(s.ctx, event)
 	}
 
