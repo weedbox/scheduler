@@ -122,6 +122,38 @@ type CronSchedule struct {
 	schedule   cron.Schedule
 }
 
+// CronSpec defines a cron schedule using structured fields instead of a string expression.
+// This provides a more type-safe and intuitive way to define cron schedules.
+//
+// Field values can be:
+//   - Specific number: e.g., "5" for day of week (Friday)
+//   - Wildcard: "*" for any value
+//   - Range: "1-5" for Monday to Friday
+//   - List: "1,3,5" for Monday, Wednesday, Friday
+//   - Step: "*/5" for every 5 units
+//
+// Examples:
+//   - Every Friday at 10:00 AM: {Minute: "0", Hour: "10", DayOfWeek: "5"}
+//   - Every day at 2:30 PM: {Minute: "30", Hour: "14"}
+//   - First day of month at midnight: {Minute: "0", Hour: "0", DayOfMonth: "1"}
+//   - Every 5 minutes: {Minute: "*/5"}
+type CronSpec struct {
+	// Minute (0-59), default "*" (every minute)
+	Minute string
+
+	// Hour (0-23), default "*" (every hour)
+	Hour string
+
+	// DayOfMonth (1-31), default "*" (every day)
+	DayOfMonth string
+
+	// Month (1-12), default "*" (every month)
+	Month string
+
+	// DayOfWeek (0-6, Sunday=0), default "*" (every day)
+	DayOfWeek string
+}
+
 // NewCronSchedule creates a new CronSchedule from a cron expression.
 // The expression follows standard cron format: minute hour day month weekday
 func NewCronSchedule(expression string) (*CronSchedule, error) {
@@ -139,6 +171,55 @@ func NewCronSchedule(expression string) (*CronSchedule, error) {
 		expression: expression,
 		schedule:   schedule,
 	}, nil
+}
+
+// NewCronScheduleFromSpec creates a new CronSchedule from a CronSpec.
+// This provides a more structured way to define cron schedules without using string expressions.
+// Empty fields default to "*" (any value).
+//
+// Examples:
+//   - Every Friday at 10:00 AM:
+//     NewCronScheduleFromSpec(&CronSpec{Minute: "0", Hour: "10", DayOfWeek: "5"})
+//   - Every day at 2:30 PM:
+//     NewCronScheduleFromSpec(&CronSpec{Minute: "30", Hour: "14"})
+//   - Every 5 minutes:
+//     NewCronScheduleFromSpec(&CronSpec{Minute: "*/5"})
+func NewCronScheduleFromSpec(spec *CronSpec) (*CronSchedule, error) {
+	if spec == nil {
+		return nil, ErrInvalidScheduleConfig
+	}
+
+	// Apply defaults
+	minute := spec.Minute
+	if minute == "" {
+		minute = "*"
+	}
+
+	hour := spec.Hour
+	if hour == "" {
+		hour = "*"
+	}
+
+	dayOfMonth := spec.DayOfMonth
+	if dayOfMonth == "" {
+		dayOfMonth = "*"
+	}
+
+	month := spec.Month
+	if month == "" {
+		month = "*"
+	}
+
+	dayOfWeek := spec.DayOfWeek
+	if dayOfWeek == "" {
+		dayOfWeek = "*"
+	}
+
+	// Build cron expression: minute hour day month weekday
+	expression := fmt.Sprintf("%s %s %s %s %s", minute, hour, dayOfMonth, month, dayOfWeek)
+
+	// Use NewCronSchedule to parse and validate
+	return NewCronSchedule(expression)
 }
 
 // Next returns the next run time based on the cron expression.

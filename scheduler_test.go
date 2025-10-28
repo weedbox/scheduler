@@ -1026,3 +1026,198 @@ func TestUpdateJobScheduleToCron(t *testing.T) {
 	assert.Equal(t, "cron", storedJob.ScheduleType)
 	assert.Equal(t, cronExpression, storedJob.ScheduleConfig)
 }
+
+// TestNewCronScheduleFromSpec tests creating CronSchedule from CronSpec
+func TestNewCronScheduleFromSpec(t *testing.T) {
+	tests := []struct {
+		name           string
+		spec           *CronSpec
+		wantErr        bool
+		wantExpression string
+		verifyFunc     func(*testing.T, *CronSchedule)
+	}{
+		{
+			name: "every friday at 10am",
+			spec: &CronSpec{
+				Minute:    "0",
+				Hour:      "10",
+				DayOfWeek: "5",
+			},
+			wantErr:        false,
+			wantExpression: "0 10 * * 5",
+			verifyFunc: func(t *testing.T, s *CronSchedule) {
+				baseTime := time.Date(2024, 1, 1, 9, 0, 0, 0, time.UTC) // Monday
+				nextRun := s.Next(baseTime)
+				assert.Equal(t, time.Friday, nextRun.Weekday())
+				assert.Equal(t, 10, nextRun.Hour())
+				assert.Equal(t, 0, nextRun.Minute())
+			},
+		},
+		{
+			name: "every day at 2:30pm",
+			spec: &CronSpec{
+				Minute: "30",
+				Hour:   "14",
+			},
+			wantErr:        false,
+			wantExpression: "30 14 * * *",
+			verifyFunc: func(t *testing.T, s *CronSchedule) {
+				baseTime := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
+				nextRun := s.Next(baseTime)
+				assert.Equal(t, 14, nextRun.Hour())
+				assert.Equal(t, 30, nextRun.Minute())
+			},
+		},
+		{
+			name: "first day of month at midnight",
+			spec: &CronSpec{
+				Minute:     "0",
+				Hour:       "0",
+				DayOfMonth: "1",
+			},
+			wantErr:        false,
+			wantExpression: "0 0 1 * *",
+			verifyFunc: func(t *testing.T, s *CronSchedule) {
+				baseTime := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
+				nextRun := s.Next(baseTime)
+				assert.Equal(t, 1, nextRun.Day())
+				assert.Equal(t, 0, nextRun.Hour())
+				assert.Equal(t, 0, nextRun.Minute())
+			},
+		},
+		{
+			name: "every 5 minutes",
+			spec: &CronSpec{
+				Minute: "*/5",
+			},
+			wantErr:        false,
+			wantExpression: "*/5 * * * *",
+			verifyFunc: func(t *testing.T, s *CronSchedule) {
+				baseTime := time.Date(2024, 1, 1, 10, 0, 0, 0, time.UTC)
+				nextRun := s.Next(baseTime)
+				assert.Equal(t, 10, nextRun.Hour())
+				assert.True(t, nextRun.Minute()%5 == 0)
+			},
+		},
+		{
+			name: "all defaults (every minute)",
+			spec: &CronSpec{},
+			wantErr:        false,
+			wantExpression: "* * * * *",
+		},
+		{
+			name: "monday to friday at 9am",
+			spec: &CronSpec{
+				Minute:    "0",
+				Hour:      "9",
+				DayOfWeek: "1-5",
+			},
+			wantErr:        false,
+			wantExpression: "0 9 * * 1-5",
+			verifyFunc: func(t *testing.T, s *CronSchedule) {
+				baseTime := time.Date(2024, 1, 1, 8, 0, 0, 0, time.UTC) // Monday
+				nextRun := s.Next(baseTime)
+				assert.Equal(t, 9, nextRun.Hour())
+				assert.True(t, nextRun.Weekday() >= time.Monday && nextRun.Weekday() <= time.Friday)
+			},
+		},
+		{
+			name:    "nil spec",
+			spec:    nil,
+			wantErr: true,
+		},
+		{
+			name: "invalid minute",
+			spec: &CronSpec{
+				Minute: "invalid",
+			},
+			wantErr: true,
+		},
+		{
+			name: "invalid hour",
+			spec: &CronSpec{
+				Hour: "25",
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			schedule, err := NewCronScheduleFromSpec(tt.spec)
+			if tt.wantErr {
+				assert.Error(t, err)
+				assert.Nil(t, schedule)
+			} else {
+				assert.NoError(t, err)
+				assert.NotNil(t, schedule)
+				assert.Equal(t, tt.wantExpression, schedule.Expression())
+
+				if tt.verifyFunc != nil {
+					tt.verifyFunc(t, schedule)
+				}
+			}
+		})
+	}
+}
+
+// TestCronSpecWithScheduler tests using CronSpec with the scheduler
+func TestCronSpecWithScheduler(t *testing.T) {
+	ctx := context.Background()
+	storage := NewMemoryStorage()
+	scheduler, state := newTestScheduler(storage)
+	scheduler.Start(ctx)
+	defer scheduler.Stop(ctx)
+
+	// Create a cron schedule using CronSpec
+	spec := &CronSpec{
+		Minute:    "0",
+		Hour:      "10",
+		DayOfWeek: "5", // Friday
+	}
+	schedule, err := NewCronScheduleFromSpec(spec)
+	require.NoError(t, err)
+
+	state.SetJobFunc(func(context.Context, JobEvent) error { return nil })
+	err = scheduler.AddJob("spec-job", schedule, map[string]string{"type": "spec"})
+	assert.NoError(t, err)
+
+	// Verify job was added
+	job, err := scheduler.GetJob("spec-job")
+	require.NoError(t, err)
+	assert.NotNil(t, job)
+	assert.Equal(t, "spec-job", job.ID())
+
+	// Verify next run is on Friday at 10:00
+	nextRun := job.NextRun()
+	assert.Equal(t, time.Friday, nextRun.Weekday())
+	assert.Equal(t, 10, nextRun.Hour())
+}
+
+// TestCronSpecPersistence tests that CronSpec schedules persist correctly
+func TestCronSpecPersistence(t *testing.T) {
+	ctx := context.Background()
+	storage := NewMemoryStorage()
+	scheduler, state := newTestScheduler(storage)
+	scheduler.Start(ctx)
+	defer scheduler.Stop(ctx)
+
+	spec := &CronSpec{
+		Minute:    "30",
+		Hour:      "14",
+		DayOfWeek: "*",
+	}
+	schedule, err := NewCronScheduleFromSpec(spec)
+	require.NoError(t, err)
+
+	state.SetJobFunc(func(context.Context, JobEvent) error { return nil })
+	err = scheduler.AddJob("spec-persist-job", schedule, nil)
+	assert.NoError(t, err)
+
+	// Verify job data in storage
+	jobData, err := storage.GetJob(ctx, "spec-persist-job")
+	require.NoError(t, err)
+	assert.Equal(t, "spec-persist-job", jobData.ID)
+	assert.Equal(t, "cron", jobData.ScheduleType)
+	assert.Equal(t, "30 14 * * *", jobData.ScheduleConfig)
+}

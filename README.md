@@ -335,6 +335,7 @@ if err := sched.AddJob("one-time-task", schedule, map[string]string{"task": "rep
 
 ### Example 3: Cron-Based Schedule
 
+#### Using Cron Expression
 ```go
 // Every Friday at 10:00 AM
 schedule, err := scheduler.NewCronSchedule("0 10 * * 5")
@@ -351,6 +352,38 @@ if err := sched.AddJob("weekly-report", schedule, map[string]string{"task": "rep
 // "0 0 1 * *"     - First day of every month at midnight
 // "*/5 * * * *"   - Every 5 minutes
 // "0 9 * * 1-5"   - Monday to Friday at 9:00 AM
+```
+
+#### Using CronSpec (Structured API)
+```go
+// Every Friday at 10:00 AM - using structured fields
+spec := &scheduler.CronSpec{
+    Minute:    "0",
+    Hour:      "10",
+    DayOfWeek: "5",  // Friday
+}
+schedule, err := scheduler.NewCronScheduleFromSpec(spec)
+if err != nil {
+    panic(err)
+}
+
+if err := sched.AddJob("weekly-report", schedule, map[string]string{"task": "report"}); err != nil {
+    panic(err)
+}
+
+// More examples:
+// Every day at 2:30 PM
+spec := &scheduler.CronSpec{Minute: "30", Hour: "14"}
+
+// Every 5 minutes
+spec := &scheduler.CronSpec{Minute: "*/5"}
+
+// Monday to Friday at 9:00 AM
+spec := &scheduler.CronSpec{
+    Minute:    "0",
+    Hour:      "9",
+    DayOfWeek: "1-5",
+}
 ```
 
 ### Example 4: Query Execution History
