@@ -4,12 +4,15 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/robfig/cron/v3"
 )
 
 const (
 	scheduleTypeInterval              = "interval"
 	scheduleTypeOnce                  = "once"
 	scheduleTypeStartAtInterval       = "start_at_interval"
+	scheduleTypeCron                  = "cron"
 	farFutureYears              int64 = 100
 )
 
@@ -107,6 +110,47 @@ func (s *StartAtIntervalSchedule) Interval() time.Duration {
 	return s.interval
 }
 
+// CronSchedule runs a job based on a cron expression.
+// Supports standard cron format: minute hour day month weekday
+// Examples:
+//   - "0 10 * * 5" - Every Friday at 10:00 AM
+//   - "30 14 * * *" - Every day at 2:30 PM
+//   - "0 0 1 * *" - First day of every month at midnight
+//   - "*/5 * * * *" - Every 5 minutes
+type CronSchedule struct {
+	expression string
+	schedule   cron.Schedule
+}
+
+// NewCronSchedule creates a new CronSchedule from a cron expression.
+// The expression follows standard cron format: minute hour day month weekday
+func NewCronSchedule(expression string) (*CronSchedule, error) {
+	if expression == "" {
+		return nil, ErrInvalidScheduleConfig
+	}
+
+	parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
+	schedule, err := parser.Parse(expression)
+	if err != nil {
+		return nil, fmt.Errorf("invalid cron expression: %w", err)
+	}
+
+	return &CronSchedule{
+		expression: expression,
+		schedule:   schedule,
+	}, nil
+}
+
+// Next returns the next run time based on the cron expression.
+func (s *CronSchedule) Next(t time.Time) time.Time {
+	return s.schedule.Next(t)
+}
+
+// Expression returns the cron expression string.
+func (s *CronSchedule) Expression() string {
+	return s.expression
+}
+
 // BasicScheduleCodec provides a schedule codec for the built-in schedules.
 type BasicScheduleCodec struct{}
 
@@ -125,6 +169,8 @@ func (c *BasicScheduleCodec) Encode(schedule Schedule) (string, string, error) {
 	case *StartAtIntervalSchedule:
 		config := fmt.Sprintf("%s|%s", s.StartAt().UTC().Format(time.RFC3339Nano), s.Interval().String())
 		return scheduleTypeStartAtInterval, config, nil
+	case *CronSchedule:
+		return scheduleTypeCron, s.Expression(), nil
 	default:
 		return "", "", fmt.Errorf("unsupported schedule type %T", schedule)
 	}
@@ -165,6 +211,11 @@ func (c *BasicScheduleCodec) Decode(scheduleType string, scheduleConfig string) 
 			return nil, err
 		}
 		return NewStartAtIntervalSchedule(startAt, interval)
+	case scheduleTypeCron:
+		if scheduleConfig == "" {
+			return nil, ErrInvalidScheduleConfig
+		}
+		return NewCronSchedule(scheduleConfig)
 	default:
 		return nil, fmt.Errorf("unsupported schedule type %s", scheduleType)
 	}

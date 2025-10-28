@@ -793,3 +793,236 @@ func TestSchedulerMultipleStartStopCycles(t *testing.T) {
 		assert.False(t, scheduler.IsRunning())
 	}
 }
+
+// TestNewCronSchedule tests creating a new CronSchedule
+func TestNewCronSchedule(t *testing.T) {
+	tests := []struct {
+		name       string
+		expression string
+		wantErr    bool
+	}{
+		{
+			name:       "valid - every friday at 10am",
+			expression: "0 10 * * 5",
+			wantErr:    false,
+		},
+		{
+			name:       "valid - every day at 2:30pm",
+			expression: "30 14 * * *",
+			wantErr:    false,
+		},
+		{
+			name:       "valid - first day of month at midnight",
+			expression: "0 0 1 * *",
+			wantErr:    false,
+		},
+		{
+			name:       "valid - every 5 minutes",
+			expression: "*/5 * * * *",
+			wantErr:    false,
+		},
+		{
+			name:       "invalid - empty expression",
+			expression: "",
+			wantErr:    true,
+		},
+		{
+			name:       "invalid - malformed expression",
+			expression: "invalid cron",
+			wantErr:    true,
+		},
+		{
+			name:       "invalid - too many fields",
+			expression: "0 10 * * 5 2024",
+			wantErr:    true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			schedule, err := NewCronSchedule(tt.expression)
+			if tt.wantErr {
+				assert.Error(t, err)
+				assert.Nil(t, schedule)
+			} else {
+				assert.NoError(t, err)
+				assert.NotNil(t, schedule)
+				assert.Equal(t, tt.expression, schedule.Expression())
+			}
+		})
+	}
+}
+
+// TestCronScheduleNext tests the Next method of CronSchedule
+func TestCronScheduleNext(t *testing.T) {
+	// Test: Every Friday at 10:00 AM
+	schedule, err := NewCronSchedule("0 10 * * 5")
+	require.NoError(t, err)
+
+	// Start from a known time (Monday, Jan 1, 2024, 09:00 AM)
+	baseTime := time.Date(2024, 1, 1, 9, 0, 0, 0, time.UTC)
+
+	// First next run should be the next Friday at 10 AM
+	nextRun := schedule.Next(baseTime)
+	assert.Equal(t, time.Friday, nextRun.Weekday())
+	assert.Equal(t, 10, nextRun.Hour())
+	assert.Equal(t, 0, nextRun.Minute())
+
+	// Calculate next run from that Friday
+	nextRun2 := schedule.Next(nextRun)
+	assert.Equal(t, time.Friday, nextRun2.Weekday())
+	assert.True(t, nextRun2.After(nextRun))
+	// Should be 7 days later
+	assert.Equal(t, 7*24*time.Hour, nextRun2.Sub(nextRun))
+}
+
+// TestCronScheduleCodec tests encoding and decoding CronSchedule
+func TestCronScheduleCodec(t *testing.T) {
+	codec := NewBasicScheduleCodec()
+
+	tests := []struct {
+		name       string
+		expression string
+	}{
+		{
+			name:       "every friday at 10am",
+			expression: "0 10 * * 5",
+		},
+		{
+			name:       "every 5 minutes",
+			expression: "*/5 * * * *",
+		},
+		{
+			name:       "first day of month",
+			expression: "0 0 1 * *",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create original schedule
+			original, err := NewCronSchedule(tt.expression)
+			require.NoError(t, err)
+
+			// Encode
+			scheduleType, scheduleConfig, err := codec.Encode(original)
+			require.NoError(t, err)
+			assert.Equal(t, "cron", scheduleType)
+			assert.Equal(t, tt.expression, scheduleConfig)
+
+			// Decode
+			decoded, err := codec.Decode(scheduleType, scheduleConfig)
+			require.NoError(t, err)
+			assert.NotNil(t, decoded)
+
+			// Verify decoded schedule works the same
+			cronDecoded, ok := decoded.(*CronSchedule)
+			require.True(t, ok)
+			assert.Equal(t, tt.expression, cronDecoded.Expression())
+
+			// Verify Next() produces same results
+			testTime := time.Date(2024, 1, 1, 9, 0, 0, 0, time.UTC)
+			assert.Equal(t, original.Next(testTime), cronDecoded.Next(testTime))
+		})
+	}
+}
+
+// TestSchedulerWithCronSchedule tests scheduler with cron-based job
+func TestSchedulerWithCronSchedule(t *testing.T) {
+	ctx := context.Background()
+	storage := NewMemoryStorage()
+	scheduler, state := newTestScheduler(storage)
+	scheduler.Start(ctx)
+	defer scheduler.Stop(ctx)
+
+	// Create a cron schedule that runs every minute
+	// Note: For testing, we use a short interval
+	schedule, err := NewCronSchedule("* * * * *")
+	require.NoError(t, err)
+
+	counter := int32(0)
+	jobFunc := func(ctx context.Context, event JobEvent) error {
+		if event.ID() == "cron-job" {
+			atomic.AddInt32(&counter, 1)
+		}
+		return nil
+	}
+
+	state.SetJobFunc(jobFunc)
+	err = scheduler.AddJob("cron-job", schedule, map[string]string{"type": "cron"})
+	assert.NoError(t, err)
+
+	// Verify job was added
+	job, err := scheduler.GetJob("cron-job")
+	require.NoError(t, err)
+	assert.NotNil(t, job)
+	assert.Equal(t, "cron-job", job.ID())
+
+	// Verify metadata
+	metadata := job.Metadata()
+	assert.Equal(t, "cron", metadata["type"])
+
+	// Verify next run is set
+	assert.False(t, job.NextRun().IsZero())
+}
+
+// TestCronSchedulePersistence tests that cron schedules persist correctly
+func TestCronSchedulePersistence(t *testing.T) {
+	ctx := context.Background()
+	storage := NewMemoryStorage()
+	scheduler, state := newTestScheduler(storage)
+	scheduler.Start(ctx)
+	defer scheduler.Stop(ctx)
+
+	expression := "0 10 * * 5"
+	schedule, err := NewCronSchedule(expression)
+	require.NoError(t, err)
+
+	state.SetJobFunc(func(context.Context, JobEvent) error { return nil })
+	err = scheduler.AddJob("friday-job", schedule, nil)
+	assert.NoError(t, err)
+
+	// Verify job data in storage
+	jobData, err := storage.GetJob(ctx, "friday-job")
+	require.NoError(t, err)
+	assert.Equal(t, "friday-job", jobData.ID)
+	assert.Equal(t, "cron", jobData.ScheduleType)
+	assert.Equal(t, expression, jobData.ScheduleConfig)
+}
+
+// TestUpdateJobScheduleToCron tests updating a job's schedule to a cron schedule
+func TestUpdateJobScheduleToCron(t *testing.T) {
+	ctx := context.Background()
+	storage := NewMemoryStorage()
+	scheduler, state := newTestScheduler(storage)
+
+	require.NoError(t, scheduler.Start(ctx))
+	require.NoError(t, scheduler.WaitUntilRunning(ctx))
+	defer scheduler.Stop(ctx)
+
+	// Start with an interval schedule
+	initialSchedule, err := NewIntervalSchedule(1 * time.Hour)
+	require.NoError(t, err)
+
+	state.SetJobFunc(func(context.Context, JobEvent) error { return nil })
+	require.NoError(t, scheduler.AddJob("job-update-cron", initialSchedule, nil))
+
+	// Update to a cron schedule
+	cronExpression := "0 10 * * 5"
+	newSchedule, err := NewCronSchedule(cronExpression)
+	require.NoError(t, err)
+
+	require.NoError(t, scheduler.UpdateJobSchedule("job-update-cron", newSchedule))
+
+	// Verify the job was updated
+	job, err := scheduler.GetJob("job-update-cron")
+	require.NoError(t, err)
+	assert.Equal(t, time.Friday, job.NextRun().Weekday())
+	assert.Equal(t, 10, job.NextRun().Hour())
+
+	// Verify storage was updated
+	storedJob, err := storage.GetJob(ctx, "job-update-cron")
+	require.NoError(t, err)
+	assert.Equal(t, "cron", storedJob.ScheduleType)
+	assert.Equal(t, cronExpression, storedJob.ScheduleConfig)
+}

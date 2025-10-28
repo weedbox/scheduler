@@ -10,10 +10,10 @@ A flexible and powerful job scheduler library for Go with pluggable storage back
 - 🚀 **Simple API** - Easy to use interface for scheduling jobs
 - 💾 **Pluggable Storage** - Support for multiple storage backends (In-Memory, GORM/SQL)
 - ⚡ **High Performance** - Efficient job execution with concurrent support
-- 🔄 **Flexible Scheduling** - Support for interval-based, cron-like, and one-time schedules
+- 🔄 **Flexible Scheduling** - Support for interval-based, cron expressions, and one-time schedules
 - 📊 **Execution History** - Track job execution records with rich query capabilities
 - 🛡️ **Thread-Safe** - Safe for concurrent use
-- 🎯 **Production Ready** - Comprehensive test coverage (87.3%)
+- 🎯 **Production Ready** - Comprehensive test coverage
 
 ## Installation
 
@@ -333,7 +333,27 @@ if err := sched.AddJob("one-time-task", schedule, map[string]string{"task": "rep
 }
 ```
 
-### Example 3: Query Execution History
+### Example 3: Cron-Based Schedule
+
+```go
+// Every Friday at 10:00 AM
+schedule, err := scheduler.NewCronSchedule("0 10 * * 5")
+if err != nil {
+    panic(err)
+}
+
+if err := sched.AddJob("weekly-report", schedule, map[string]string{"task": "report"}); err != nil {
+    panic(err)
+}
+
+// Other cron examples:
+// "30 14 * * *"   - Every day at 2:30 PM
+// "0 0 1 * *"     - First day of every month at midnight
+// "*/5 * * * *"   - Every 5 minutes
+// "0 9 * * 1-5"   - Monday to Friday at 9:00 AM
+```
+
+### Example 4: Query Execution History
 
 ```go
 ctx := context.Background()
@@ -365,7 +385,7 @@ for _, exec := range executions {
 }
 ```
 
-### Example 4: Job with Error Handling
+### Example 5: Job with Error Handling
 
 ```go
 handler := func(ctx context.Context, event scheduler.JobEvent) error {
@@ -411,7 +431,7 @@ for _, exec := range failedExecutions {
 }
 ```
 
-### Example 5: Graceful Shutdown
+### Example 6: Graceful Shutdown
 
 ```go
 func main() {
@@ -461,7 +481,7 @@ func main() {
 }
 ```
 
-### Example 6: Multiple Database Support
+### Example 7: Multiple Database Support
 
 ```go
 // PostgreSQL
@@ -485,7 +505,7 @@ db, _ := gorm.Open(sqlite.Open("scheduler.db"), &gorm.Config{})
 storage := scheduler.NewGormStorage(db)
 ```
 
-### Example 7: Job Metadata
+### Example 8: Job Metadata
 
 ```go
 // Save job with metadata
@@ -512,7 +532,7 @@ fmt.Printf("Generating %s report for %s\n",
     retrieved.Metadata["report_type"], department)
 ```
 
-### Example 8: Clean Up Old Executions
+### Example 9: Clean Up Old Executions
 
 ```go
 // Delete execution records older than 30 days

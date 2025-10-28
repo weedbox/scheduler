@@ -185,3 +185,77 @@ func TestGormStorageOnceJobExecutesAfterRestart(t *testing.T) {
 	require.NoError(t, scheduler2.Stop(ctx))
 	require.Equal(t, int32(1), atomic.LoadInt32(&runCount))
 }
+
+// TestGormStorageCronJobPersistenceAcrossRestart verifies that cron jobs persisted with GORM
+// are restored and continue executing after the scheduler restarts.
+func TestGormStorageCronJobPersistenceAcrossRestart(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "scheduler_cron.db")
+
+	openDB := func() *gorm.DB {
+		db, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{})
+		require.NoError(t, err)
+		return db
+	}
+
+	state := newTestHandlerState()
+	var runCount int32
+	state.SetJobFunc(func(ctx context.Context, event JobEvent) error {
+		if event.ID() == "cron-job" {
+			atomic.AddInt32(&runCount, 1)
+		}
+		return nil
+	})
+
+	// Every minute (for testing purposes, we'll use a short interval in actual test)
+	// In reality, cron "* * * * *" runs every minute at :00 seconds
+	cronSchedule, err := NewCronSchedule("* * * * *")
+	require.NoError(t, err)
+
+	// First scheduler instance: add cron job and wait for at least one execution.
+	db1 := openDB()
+	storage1 := NewGormStorage(db1)
+	scheduler1 := NewScheduler(storage1, state.Handler(), NewBasicScheduleCodec())
+
+	require.NoError(t, scheduler1.Start(ctx))
+	require.NoError(t, scheduler1.AddJob("cron-job", cronSchedule, map[string]string{"type": "cron"}))
+
+	// Verify the job was persisted with correct schedule type and config
+	jobData, err := storage1.GetJob(ctx, "cron-job")
+	require.NoError(t, err)
+	require.Equal(t, "cron", jobData.ScheduleType)
+	require.Equal(t, "* * * * *", jobData.ScheduleConfig)
+
+	// Wait up to 70 seconds for the job to run at least once
+	// (since cron runs at the top of the minute)
+	require.Eventually(t, func() bool {
+		return atomic.LoadInt32(&runCount) >= 1
+	}, 70*time.Second, 1*time.Second)
+
+	require.NoError(t, scheduler1.Stop(ctx))
+
+	beforeRestart := atomic.LoadInt32(&runCount)
+	require.GreaterOrEqual(t, beforeRestart, int32(1))
+
+	// Second scheduler instance: ensure cron job is reloaded and continues to run.
+	db2 := openDB()
+	storage2 := NewGormStorage(db2)
+	scheduler2 := NewScheduler(storage2, state.Handler(), NewBasicScheduleCodec())
+
+	require.NoError(t, scheduler2.Start(ctx))
+
+	// Verify the job was loaded from storage
+	jobs := scheduler2.ListJobs()
+	require.Len(t, jobs, 1)
+	require.Equal(t, "cron-job", jobs[0].ID())
+
+	// Wait for at least one more execution after restart
+	require.Eventually(t, func() bool {
+		return atomic.LoadInt32(&runCount) >= beforeRestart+1
+	}, 70*time.Second, 1*time.Second)
+
+	require.NoError(t, scheduler2.Stop(ctx))
+}
