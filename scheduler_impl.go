@@ -143,11 +143,20 @@ func (s *schedulerImpl) AddJob(id string, schedule Schedule, metadata map[string
 	}
 
 	now := time.Now()
+	nextRun := schedule.Next(now)
+	if onceSchedule, ok := schedule.(*OnceSchedule); ok {
+		runAt := onceSchedule.RunAt()
+		if runAt.After(now) {
+			nextRun = runAt
+		} else {
+			nextRun = now
+		}
+	}
 	job := &jobImpl{
 		id:       id,
 		schedule: schedule,
 		metadata: copyMetadata(metadata),
-		nextRun:  schedule.Next(now),
+		nextRun:  nextRun,
 		lastRun:  time.Time{},
 		running:  false,
 	}
@@ -200,6 +209,14 @@ func (s *schedulerImpl) UpdateJobSchedule(id string, schedule Schedule) error {
 
 	now := time.Now()
 	nextRun := schedule.Next(now)
+	if onceSchedule, ok := schedule.(*OnceSchedule); ok {
+		runAt := onceSchedule.RunAt()
+		if runAt.After(now) {
+			nextRun = runAt
+		} else {
+			nextRun = now
+		}
+	}
 
 	s.mu.Lock()
 	job, exists := s.jobs[id]

@@ -372,6 +372,37 @@ func TestSchedulerJobExecution(t *testing.T) {
 	assert.False(t, job.LastRun().IsZero())
 }
 
+func TestSchedulerOnceScheduleAtOrBeforeNowRuns(t *testing.T) {
+	ctx := context.Background()
+	storage := NewMemoryStorage()
+	scheduler, state := newTestScheduler(storage)
+	require.NoError(t, scheduler.Start(ctx))
+	t.Cleanup(func() {
+		require.NoError(t, scheduler.Stop(ctx))
+	})
+
+	runAt := time.Now()
+	schedule, err := NewOnceSchedule(runAt)
+	require.NoError(t, err)
+
+	done := make(chan struct{}, 1)
+	state.SetJobFunc(func(ctx context.Context, event JobEvent) error {
+		if event.ID() == "job-now" {
+			done <- struct{}{}
+		}
+		return nil
+	})
+
+	err = scheduler.AddJob("job-now", schedule, nil)
+	require.NoError(t, err)
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("job did not run when scheduled at or before now")
+	}
+}
+
 // TestSchedulerJobExecutionWithError tests job execution that returns an error
 func TestSchedulerJobExecutionWithError(t *testing.T) {
 	ctx := context.Background()
