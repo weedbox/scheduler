@@ -402,6 +402,15 @@ func (s *schedulerImpl) checkAndRunJobs() {
 
 // executeJob executes a single job
 func (s *schedulerImpl) executeJob(job *jobImpl) {
+	// Panic recovery: ensure job.running is reset so the job won't be stuck forever
+	defer func() {
+		if r := recover(); r != nil {
+			job.mu.Lock()
+			job.running = false
+			job.mu.Unlock()
+		}
+	}()
+
 	job.mu.Lock()
 	if job.running {
 		job.mu.Unlock()
