@@ -546,23 +546,22 @@ func (s *natsSchedulerImpl) handleMessage(msg jetstream.Msg) {
 		return
 	}
 
-	// Skip already-completed one-time schedules
+	// Skip already-executed one-time schedules
 	job.mu.RLock()
 	currentSchedule := job.schedule
 	lastRun := job.lastRun
 	job.mu.RUnlock()
-	if onceSchedule, ok := currentSchedule.(*OnceSchedule); ok {
-		if !lastRun.IsZero() || !onceSchedule.RunAt().After(time.Now()) {
-			_ = msg.Ack()
-			return
-		}
+	if _, ok := currentSchedule.(*OnceSchedule); ok && !lastRun.IsZero() {
+		_ = msg.Ack()
+		return
 	}
 
 	// Guard: if the scheduled time has not arrived yet, NAK with delay.
 	// This serves as a fallback when the NATS server does not support
 	// AllowMsgSchedules or the Nats-Scheduled-Delivery header is ignored.
+	// Using a 100ms tolerance to account for minor clock drift and delivery latency.
 	waitTime := time.Until(schedMsg.ScheduledAt)
-	if waitTime > time.Second {
+	if waitTime > 100*time.Millisecond {
 		delay := waitTime
 		if delay > 30*time.Second {
 			delay = 30 * time.Second

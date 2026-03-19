@@ -447,6 +447,106 @@ func TestNATSScheduler_NoRapidFireAfterRestart(t *testing.T) {
 		"interval job should not rapid-fire after restart, got %d executions", finalCount)
 }
 
+func TestNATSScheduler_AllScheduleTypes(t *testing.T) {
+	_, js := startNATSServer(t)
+
+	var mu sync.Mutex
+	executions := make(map[string]int)
+
+	handler := func(ctx context.Context, event JobEvent) error {
+		mu.Lock()
+		executions[event.ID()]++
+		mu.Unlock()
+		return nil
+	}
+
+	opts := []NATSSchedulerOption{
+		WithNATSStreamName("ALL_TYPES_TEST"),
+		WithNATSSubjectPrefix("all_types"),
+		WithNATSConsumerName("all-types-worker"),
+		WithNATSSchedulerJobBucket("ALL_TYPES_JOBS"),
+		WithNATSSchedulerExecBucket("ALL_TYPES_EXECS"),
+	}
+
+	s := NewNATSScheduler(js, handler, opts...)
+	ctx := context.Background()
+	require.NoError(t, s.Start(ctx))
+	defer s.Stop(ctx)
+
+	// 1. IntervalSchedule — every 500ms
+	intervalSchedule, err := NewIntervalSchedule(500 * time.Millisecond)
+	require.NoError(t, err)
+	require.NoError(t, s.AddJob("interval-job", intervalSchedule, nil))
+
+	// 2. OnceSchedule — run once after 200ms
+	onceSchedule, err := NewOnceSchedule(time.Now().Add(200 * time.Millisecond))
+	require.NoError(t, err)
+	require.NoError(t, s.AddJob("once-job", onceSchedule, nil))
+
+	// 3. CronSchedule — every minute (use "* * * * *" for fastest possible cron)
+	cronSchedule, err := NewCronSchedule("* * * * *")
+	require.NoError(t, err)
+	require.NoError(t, s.AddJob("cron-job", cronSchedule, nil))
+
+	// 4. StartAtIntervalSchedule — start after 300ms, then every 500ms
+	startAtSchedule, err := NewStartAtIntervalSchedule(
+		time.Now().Add(300*time.Millisecond),
+		500*time.Millisecond,
+	)
+	require.NoError(t, err)
+	require.NoError(t, s.AddJob("startat-job", startAtSchedule, nil))
+
+	// --- Verify IntervalSchedule: should fire multiple times ---
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return executions["interval-job"] >= 2
+	}, 10*time.Second, 50*time.Millisecond,
+		"IntervalSchedule: expected >= 2 executions")
+
+	// --- Verify OnceSchedule: should fire exactly once ---
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return executions["once-job"] >= 1
+	}, 10*time.Second, 50*time.Millisecond,
+		"OnceSchedule: expected >= 1 execution")
+
+	// --- Verify StartAtIntervalSchedule: should fire multiple times ---
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return executions["startat-job"] >= 2
+	}, 10*time.Second, 50*time.Millisecond,
+		"StartAtIntervalSchedule: expected >= 2 executions")
+
+	// --- Verify CronSchedule: job registered with valid next run ---
+	cronJob, err := s.GetJob("cron-job")
+	require.NoError(t, err)
+	assert.False(t, cronJob.NextRun().IsZero(),
+		"CronSchedule: NextRun should not be zero")
+	assert.True(t, cronJob.NextRun().After(time.Now().Add(-time.Second)),
+		"CronSchedule: NextRun should be in the future (or very recent)")
+
+	// Wait a bit and verify OnceSchedule didn't fire again
+	time.Sleep(1 * time.Second)
+	mu.Lock()
+	onceCount := executions["once-job"]
+	intervalCount := executions["interval-job"]
+	startAtCount := executions["startat-job"]
+	mu.Unlock()
+
+	assert.Equal(t, 1, onceCount,
+		"OnceSchedule: should execute exactly once, got %d", onceCount)
+	assert.GreaterOrEqual(t, intervalCount, 2,
+		"IntervalSchedule: should execute multiple times, got %d", intervalCount)
+	assert.GreaterOrEqual(t, startAtCount, 2,
+		"StartAtIntervalSchedule: should execute multiple times, got %d", startAtCount)
+
+	t.Logf("Results — interval: %d, once: %d, startat: %d, cron next: %s",
+		intervalCount, onceCount, startAtCount, cronJob.NextRun().Format("15:04:05"))
+}
+
 func TestParseNATSVersion(t *testing.T) {
 	tests := []struct {
 		version     string
