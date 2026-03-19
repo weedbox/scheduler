@@ -8,11 +8,12 @@ A flexible and powerful job scheduler library for Go with pluggable storage back
 ## Features
 
 - 🚀 **Simple API** - Easy to use interface for scheduling jobs
-- 💾 **Pluggable Storage** - Support for multiple storage backends (In-Memory, GORM/SQL)
+- 💾 **Pluggable Storage** - Support for multiple storage backends (In-Memory, GORM/SQL, NATS JetStream KV)
 - ⚡ **High Performance** - Efficient job execution with concurrent support
 - 🔄 **Flexible Scheduling** - Support for interval-based, cron expressions, and one-time schedules
 - 📊 **Execution History** - Track job execution records with rich query capabilities
 - 🛡️ **Thread-Safe** - Safe for concurrent use
+- 🌐 **Distributed Ready** - Optional NATS JetStream backend with built-in distributed scheduling
 - 🎯 **Production Ready** - Comprehensive test coverage
 
 ## Installation
@@ -27,6 +28,14 @@ go get github.com/Weedbox/scheduler
 go get gorm.io/gorm
 go get gorm.io/driver/sqlite  # or postgres, mysql, etc.
 ```
+
+### For NATS JetStream Support
+
+```bash
+go get github.com/nats-io/nats.go
+```
+
+Requires NATS Server 2.12+ with JetStream enabled.
 
 ## Quick Start
 
@@ -137,6 +146,62 @@ func main() {
     defer sched.Stop(ctx)
 
     // Add your jobs...
+}
+```
+
+### Using NATS JetStream (Distributed)
+
+The NATS JetStream scheduler replaces the polling mechanism with JetStream's native scheduled message delivery. It provides built-in distributed scheduling, automatic failover, and persistence via JetStream KV Store — no external database required.
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+    "time"
+
+    "github.com/Weedbox/scheduler"
+    "github.com/nats-io/nats.go"
+    "github.com/nats-io/nats.go/jetstream"
+)
+
+func main() {
+    // Connect to NATS
+    nc, err := nats.Connect(nats.DefaultURL)
+    if err != nil {
+        panic(err)
+    }
+    defer nc.Close()
+
+    js, err := jetstream.New(nc)
+    if err != nil {
+        panic(err)
+    }
+
+    // Create NATS scheduler
+    handler := func(ctx context.Context, event scheduler.JobEvent) error {
+        fmt.Printf("Job %s executed at %s\n", event.ID(), time.Now())
+        return nil
+    }
+
+    sched := scheduler.NewNATSScheduler(js, handler)
+
+    ctx := context.Background()
+    if err := sched.Start(ctx); err != nil {
+        panic(err)
+    }
+    defer sched.Stop(ctx)
+
+    // Add jobs — same API as the standard scheduler
+    schedule, _ := scheduler.NewIntervalSchedule(10 * time.Second)
+    sched.AddJob("heartbeat", schedule, map[string]string{"type": "interval"})
+
+    cronSchedule, _ := scheduler.NewCronSchedule("0 10 * * 5")
+    sched.AddJob("weekly-report", cronSchedule, map[string]string{"type": "cron"})
+
+    // Jobs are persisted in NATS JetStream KV and survive restarts
+    select {}
 }
 ```
 
@@ -302,6 +367,91 @@ storage := scheduler.NewGormStorage(db)
 - Indexed fields for performance
 - JSON metadata support
 - Health check support
+
+### NATS JetStream Storage
+
+Implements the `Storage` interface using NATS JetStream KV Store. Can be used with the standard polling scheduler as a drop-in storage replacement.
+
+```go
+import (
+    "github.com/nats-io/nats.go"
+    "github.com/nats-io/nats.go/jetstream"
+)
+
+nc, _ := nats.Connect(nats.DefaultURL)
+js, _ := jetstream.New(nc)
+
+storage := scheduler.NewNATSStorage(js,
+    scheduler.WithNATSStorageJobBucket("MY_JOBS"),
+    scheduler.WithNATSStorageExecBucket("MY_EXECS"),
+)
+
+// Use with the standard polling scheduler
+sched := scheduler.NewScheduler(storage, handler, scheduler.NewBasicScheduleCodec())
+```
+
+### NATS JetStream Scheduler
+
+A dedicated scheduler implementation that uses JetStream's native scheduled message delivery (`AllowMsgSchedules`) instead of polling. Requires NATS Server 2.12+.
+
+```go
+nc, _ := nats.Connect(nats.DefaultURL)
+js, _ := jetstream.New(nc)
+
+sched := scheduler.NewNATSScheduler(js, handler,
+    scheduler.WithNATSStreamName("SCHEDULER"),
+    scheduler.WithNATSSubjectPrefix("scheduler"),
+    scheduler.WithNATSConsumerName("scheduler-worker"),
+    scheduler.WithNATSSchedulerJobBucket("SCHEDULER_JOBS"),
+    scheduler.WithNATSSchedulerExecBucket("SCHEDULER_EXECUTIONS"),
+)
+```
+
+**Architecture:**
+```
+NewNATSScheduler
+├── JetStream Stream (AllowMsgSchedules)
+│   └── Messages with "Nats-Scheduled-Delivery: @at <time>" header
+├── JetStream Consumer (durable, work queue)
+│   └── Receives triggered messages → executes JobHandler → schedules next run
+└── JetStream KV Store
+    ├── Job metadata (schedule, status, next/last run)
+    └── Execution records (start/end time, duration, errors)
+```
+
+**Comparison with standard scheduler:**
+
+| | Standard (`NewScheduler`) | NATS JetStream (`NewNATSScheduler`) |
+|---|---|---|
+| Triggering | Polls every second | JetStream delivers at scheduled time |
+| Persistence | Pluggable Storage interface | JetStream KV Store (built-in) |
+| Distributed | Requires external coordination | Built-in via consumer ack mechanism |
+| Failover | Manual implementation | Automatic message redelivery |
+| Scaling | Single instance | Multiple workers sharing a consumer |
+| Requirements | None (or a database) | NATS Server 2.12+ with JetStream |
+
+**Distributed usage:**
+
+Multiple workers can share the same NATS scheduler. JetStream's consumer ensures each job trigger is delivered to exactly one worker:
+
+```bash
+# Terminal 1 — first worker
+NATS_URL=nats://localhost:4222 go run .
+
+# Terminal 2 — second worker (same consumer group, auto load-balanced)
+NATS_URL=nats://localhost:4222 go run .
+```
+
+**Configuration options:**
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `WithNATSStreamName` | `SCHEDULER` | JetStream stream name |
+| `WithNATSSubjectPrefix` | `scheduler` | NATS subject prefix for job messages |
+| `WithNATSConsumerName` | `scheduler-worker` | Durable consumer name |
+| `WithNATSSchedulerJobBucket` | `SCHEDULER_JOBS` | KV bucket for job metadata |
+| `WithNATSSchedulerExecBucket` | `SCHEDULER_EXECUTIONS` | KV bucket for execution records |
+| `WithNATSSchedulerCodec` | `BasicScheduleCodec` | Schedule encoder/decoder |
 
 ## Examples
 
@@ -803,6 +953,7 @@ var (
     ErrInvalidJobData            = errors.New("invalid job data")
     ErrJobDataNotFound           = errors.New("job data not found")
     ErrExecutionHistoryNotFound  = errors.New("execution history not found")
+    ErrNATSServerTooOld          = errors.New("NATS server does not support scheduled message delivery (requires 2.12+)")
 )
 ```
 
@@ -846,7 +997,8 @@ defer func() {
 ### 3. Use Appropriate Storage
 
 - **Development/Testing**: Use `MemoryStorage`
-- **Production**: Use `GormStorage` with PostgreSQL or MySQL
+- **Production (single instance)**: Use `GormStorage` with PostgreSQL or MySQL
+- **Production (distributed)**: Use `NewNATSScheduler` with NATS JetStream
 
 ### 4. Monitor Job Execution
 
@@ -917,6 +1069,7 @@ go tool cover -html=coverage.out
 
 - **In-Memory Storage**: Fast, suitable for high-frequency jobs
 - **GORM Storage**: Optimized with indexes on frequently queried fields
+- **NATS JetStream**: Event-driven delivery eliminates polling overhead; consumer-based distribution scales horizontally
 - **Concurrent Execution**: Jobs run in separate goroutines
 - **Graceful Shutdown**: Waits for running jobs to complete
 
@@ -926,7 +1079,7 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+This project is licensed under the APL - see the LICENSE file for details.
 
 ## Support
 
