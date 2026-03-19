@@ -5,6 +5,15 @@ A flexible and powerful job scheduler library for Go with pluggable storage back
 [![Go Version](https://img.shields.io/badge/go-1.23+-blue.svg)](https://golang.org)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
+## Requirements
+
+| Component | Version | Notes |
+|-----------|---------|-------|
+| Go | 1.24+ | Required by NATS client dependency |
+| NATS Server | 2.12+ | Only for NATS JetStream scheduler; must have JetStream enabled |
+
+> The standard scheduler (`NewScheduler`) with In-Memory or GORM storage has no NATS dependency and works with Go 1.23+.
+
 ## Features
 
 - 🚀 **Simple API** - Easy to use interface for scheduling jobs
@@ -392,7 +401,10 @@ sched := scheduler.NewScheduler(storage, handler, scheduler.NewBasicScheduleCode
 
 ### NATS JetStream Scheduler
 
-A dedicated scheduler implementation that uses JetStream's native scheduled message delivery (`AllowMsgSchedules`) instead of polling. Requires NATS Server 2.12+.
+A dedicated scheduler implementation that uses JetStream's native scheduled message delivery (`AllowMsgSchedules`) instead of polling.
+
+> **Requires NATS Server 2.12+** with JetStream enabled (`nats-server -js`).
+> `Start()` will return `ErrNATSServerTooOld` if the connected server version is below 2.12, or if the server silently ignores `AllowMsgSchedules`.
 
 ```go
 nc, _ := nats.Connect(nats.DefaultURL)
