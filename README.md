@@ -465,6 +465,54 @@ NATS_URL=nats://localhost:4222 go run .
 | `WithNATSSchedulerExecBucket` | `SCHEDULER_EXECUTIONS` | KV bucket for execution records |
 | `WithNATSSchedulerCodec` | `BasicScheduleCodec` | Schedule encoder/decoder |
 
+## Storage Migration
+
+`MigrateStorage` copies all jobs and execution records from one storage backend to another. It works with any combination of `Storage` implementations.
+
+```go
+func MigrateStorage(ctx context.Context, src Storage, dst Storage) (*MigrateResult, error)
+```
+
+### GORM → NATS JetStream Migration
+
+```go
+// 1. Stop the old scheduler
+oldSched.Stop(ctx)
+
+// 2. Set up source and destination
+gormStorage := scheduler.NewGormStorage(db)
+gormStorage.Initialize(ctx)
+
+natsStorage := scheduler.NewNATSStorage(js)
+natsStorage.Initialize(ctx)
+
+// 3. Migrate — one line
+result, err := scheduler.MigrateStorage(ctx, gormStorage, natsStorage)
+fmt.Printf("Migrated %d jobs, %d executions\n", result.JobsMigrated, result.ExecutionsMigrated)
+
+// 4. Switch to NATS scheduler — jobs resume automatically from KV
+sched := scheduler.NewNATSScheduler(js, handler)
+sched.Start(ctx)
+```
+
+### Migration Result
+
+```go
+type MigrateResult struct {
+    JobsMigrated       int  // jobs successfully copied
+    JobsSkipped        int  // jobs already in destination (skipped)
+    ExecutionsMigrated int  // execution records copied
+    ExecutionsSkipped  int  // execution records already in destination (skipped)
+}
+```
+
+**Key properties:**
+- **Generic** — works between any `Storage` implementations (GORM→NATS, Memory→GORM, etc.)
+- **Idempotent** — safe to run multiple times; existing data is skipped
+- **Non-destructive** — source data is only read, never modified
+
+See the [migration example](examples/migrate_gorm_to_nats) for a complete working demo.
+
 ## Examples
 
 ### Example 1: Interval-Based Schedule
