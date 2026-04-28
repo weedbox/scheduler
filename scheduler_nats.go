@@ -27,6 +27,14 @@ const (
 	// required for AllowMsgSchedules support.
 	natsMinMajor = 2
 	natsMinMinor = 12
+
+	// defaultStreamDuplicatesWindow bounds how long the stream tracks
+	// Nats-Msg-Id values for deduplication. With multiple peers running
+	// loadJobsFromKV at startup (or republishing after a leadership change),
+	// each peer would otherwise produce its own copy of the same scheduled
+	// message; a wide window keeps the second-and-later copies suppressed
+	// even when peer restarts are spread out over hours.
+	defaultStreamDuplicatesWindow = 24 * time.Hour
 )
 
 // ErrNATSServerTooOld indicates the connected NATS server does not support
@@ -84,6 +92,37 @@ func WithNATSSchedulerCodec(codec ScheduleCodec) NATSSchedulerOption {
 	}
 }
 
+// WithSkipStartupCleanup controls whether Start() purges the scheduled-message
+// stream and deletes the existing durable consumer.
+//
+// The default (false) preserves the original v0.0.5 behaviour and is safe for
+// single-instance deployments: stale messages from the previous run are
+// dropped and a fresh consumer is created.
+//
+// In multi-instance deployments where several processes share the same NATS
+// JetStream cluster (and therefore the same SCHEDULER stream / KV buckets /
+// durable consumer), the default is destructive: a peer's Start() wipes the
+// scheduled messages a healthy peer has already published, and deletes the
+// durable consumer the healthy peer is consuming from. Pass true to skip both
+// operations and rely on the per-message Nats-Msg-Id (combined with the
+// stream's Duplicates window) to suppress the duplicate publishes that
+// loadJobsFromKV would otherwise produce.
+func WithSkipStartupCleanup(skip bool) NATSSchedulerOption {
+	return func(s *natsSchedulerImpl) {
+		s.skipStartupCleanup = skip
+	}
+}
+
+// WithStreamDuplicatesWindow overrides the duration the stream tracks
+// Nats-Msg-Id values for deduplication. Larger values catch republishes that
+// arrive long after the original publish (e.g. a peer that restarts hours
+// later), at the cost of more server-side state.
+func WithStreamDuplicatesWindow(window time.Duration) NATSSchedulerOption {
+	return func(s *natsSchedulerImpl) {
+		s.duplicatesWindow = window
+	}
+}
+
 // natsSchedulerImpl implements the Scheduler interface using NATS JetStream.
 // It uses JetStream scheduled message delivery (AllowMsgSchedules, NATS 2.12+)
 // for triggering jobs, and JetStream KV Store for persisting job metadata
@@ -108,6 +147,9 @@ type natsSchedulerImpl struct {
 	consumerName  string
 	jobBucket     string
 	execBucket    string
+
+	skipStartupCleanup bool
+	duplicatesWindow   time.Duration
 }
 
 // NewNATSScheduler creates a new Scheduler backed by NATS JetStream.
@@ -126,16 +168,17 @@ type natsSchedulerImpl struct {
 //	s.Start(ctx)
 func NewNATSScheduler(js jetstream.JetStream, handler JobHandler, opts ...NATSSchedulerOption) Scheduler {
 	s := &natsSchedulerImpl{
-		jobs:          make(map[string]*jobImpl),
-		handler:       handler,
-		codec:         NewBasicScheduleCodec(),
-		js:            js,
-		startReady:    make(chan struct{}),
-		streamName:    defaultNATSStreamName,
-		subjectPrefix: defaultNATSSubjectPrefix,
-		consumerName:  defaultNATSConsumerName,
-		jobBucket:     defaultNATSJobBucket,
-		execBucket:    defaultNATSExecBucket,
+		jobs:             make(map[string]*jobImpl),
+		handler:          handler,
+		codec:            NewBasicScheduleCodec(),
+		js:               js,
+		startReady:       make(chan struct{}),
+		streamName:       defaultNATSStreamName,
+		subjectPrefix:    defaultNATSSubjectPrefix,
+		consumerName:     defaultNATSConsumerName,
+		jobBucket:        defaultNATSJobBucket,
+		execBucket:       defaultNATSExecBucket,
+		duplicatesWindow: defaultStreamDuplicatesWindow,
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -178,12 +221,16 @@ func (s *natsSchedulerImpl) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to create exec KV bucket: %w", err)
 	}
 
-	// Create stream with scheduled delivery support
+	// Create stream with scheduled delivery support. The Duplicates window
+	// pairs with the per-message Nats-Msg-Id set by publishScheduledMessage
+	// to suppress duplicate publishes — most importantly the ones produced
+	// when several peers each run loadJobsFromKV at startup.
 	s.stream, err = s.js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
 		Name:              s.streamName,
 		Subjects:          []string{s.subjectPrefix + ".>"},
 		AllowMsgSchedules: true,
 		Retention:         jetstream.WorkQueuePolicy,
+		Duplicates:        s.duplicatesWindow,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create stream: %w", err)
@@ -196,11 +243,15 @@ func (s *natsSchedulerImpl) Start(ctx context.Context) error {
 			ErrNATSServerTooOld, s.js.Conn().ConnectedServerVersion())
 	}
 
-	// Purge stale scheduled messages from previous runs to avoid duplicates
-	_ = s.stream.Purge(ctx)
-
-	// Delete old consumer to clear any pending ack state from previous runs
-	_ = s.stream.DeleteConsumer(ctx, s.consumerName)
+	if !s.skipStartupCleanup {
+		// Single-instance behaviour: clear stale state from a previous run.
+		// Skipped when WithSkipStartupCleanup(true) is set so a starting peer
+		// does not wipe the scheduled messages a healthy peer just published
+		// and does not delete the durable consumer that healthy peer is
+		// consuming from.
+		_ = s.stream.Purge(ctx)
+		_ = s.stream.DeleteConsumer(ctx, s.consumerName)
+	}
 
 	// Load persisted jobs and reschedule them
 	if err := s.loadJobsFromKV(ctx); err != nil {
@@ -540,10 +591,30 @@ func (s *natsSchedulerImpl) handleMessage(msg jetstream.Msg) {
 	running := s.running
 	s.mu.RUnlock()
 
-	if !exists || !running {
-		// Job was removed or scheduler is stopping; discard message
+	if !running {
 		_ = msg.Ack()
 		return
+	}
+
+	if !exists {
+		// In multi-instance deployments the durable consumer fans messages
+		// out across peers; this peer may receive a message for a job that
+		// another peer added after our Start(). Lazy-load from KV (the
+		// shared source of truth) before discarding.
+		loaded, err := s.loadJobFromKV(s.ctx, jobID)
+		if err != nil {
+			// Genuinely unknown job (removed or never persisted).
+			_ = msg.Ack()
+			return
+		}
+		s.mu.Lock()
+		if existing, ok := s.jobs[jobID]; ok {
+			job = existing
+		} else {
+			s.jobs[jobID] = loaded
+			job = loaded
+		}
+		s.mu.Unlock()
 	}
 
 	// Skip already-executed one-time schedules
@@ -552,6 +623,22 @@ func (s *natsSchedulerImpl) handleMessage(msg jetstream.Msg) {
 	lastRun := job.lastRun
 	job.mu.RUnlock()
 	if _, ok := currentSchedule.(*OnceSchedule); ok && !lastRun.IsZero() {
+		_ = msg.Ack()
+		return
+	}
+
+	// Skip messages whose scheduledAt is at or before the last execution.
+	// Covers two scenarios:
+	//   1. A peer was offline long enough for stale messages to accumulate
+	//      in the stream; on restart they would otherwise re-fire with past
+	//      scheduledAt values.
+	//   2. A duplicate publish that slipped past the Duplicates window (e.g.
+	//      a peer restart spread wider than WithStreamDuplicatesWindow).
+	// lastRun is a per-peer view and may lag the KV truth across pods, so
+	// this catches the common cases without claiming exactness — the
+	// authoritative cross-pod ordering still relies on JetStream's
+	// at-most-once delivery per durable consumer.
+	if !lastRun.IsZero() && !schedMsg.ScheduledAt.After(lastRun) {
 		_ = msg.Ack()
 		return
 	}
@@ -688,6 +775,12 @@ func (s *natsSchedulerImpl) executeJob(job *jobImpl, scheduledAt time.Time) {
 }
 
 // publishScheduledMessage publishes a NATS message with scheduled delivery header.
+//
+// The message carries a deterministic Nats-Msg-Id derived from (jobID,
+// scheduledAt). Combined with the stream's Duplicates window, this prevents
+// duplicate executions when multiple peers republish the same scheduled
+// message concurrently — for example two pods both running loadJobsFromKV
+// after a cluster cold-start.
 func (s *natsSchedulerImpl) publishScheduledMessage(ctx context.Context, jobID string, scheduledAt time.Time) error {
 	subject := s.jobSubject(jobID)
 	payload, err := json.Marshal(scheduleMessage{
@@ -704,6 +797,7 @@ func (s *natsSchedulerImpl) publishScheduledMessage(ctx context.Context, jobID s
 		Header:  nats.Header{},
 	}
 	msg.Header.Set(natsScheduledDeliveryHeader, "@at "+scheduledAt.UTC().Format(time.RFC3339))
+	msg.Header.Set(nats.MsgIdHdr, fmt.Sprintf("%s-%d", jobID, scheduledAt.UnixNano()))
 
 	_, err = s.js.PublishMsg(ctx, msg)
 	return err
@@ -712,6 +806,34 @@ func (s *natsSchedulerImpl) publishScheduledMessage(ctx context.Context, jobID s
 // jobSubject returns the NATS subject for a given job ID.
 func (s *natsSchedulerImpl) jobSubject(jobID string) string {
 	return s.subjectPrefix + ".jobs." + jobID
+}
+
+// loadJobFromKV reads a single job entry from the KV bucket and rebuilds an
+// in-memory jobImpl from it. Used by handleMessage to recover a job that this
+// peer has not seen because another peer added it after our Start().
+func (s *natsSchedulerImpl) loadJobFromKV(ctx context.Context, id string) (*jobImpl, error) {
+	if s.jobKV == nil {
+		return nil, ErrJobNotFound
+	}
+	entry, err := s.jobKV.Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	var jv natsJobValue
+	if err := json.Unmarshal(entry.Value(), &jv); err != nil {
+		return nil, err
+	}
+	schedule, err := s.codec.Decode(jv.ScheduleType, jv.ScheduleConfig)
+	if err != nil {
+		return nil, err
+	}
+	return &jobImpl{
+		id:       jv.ID,
+		schedule: schedule,
+		metadata: copyMetadata(jv.Metadata),
+		nextRun:  jv.NextRun,
+		lastRun:  jv.LastRun,
+	}, nil
 }
 
 // loadJobsFromKV loads persisted jobs from KV store and publishes scheduled messages for them.
