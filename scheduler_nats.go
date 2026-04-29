@@ -720,12 +720,15 @@ func (s *natsSchedulerImpl) executeJob(job *jobImpl, scheduledAt time.Time) {
 	endTime := time.Now()
 	duration := endTime.Sub(startTime)
 
-	// Update job state
+	// Update job state. Note: job.running stays true until the post-handler
+	// section below finishes. waitForJobs() (called from Stop) only checks
+	// job.IsRunning(), so resetting running here would let Stop return —
+	// and the caller may then close the NATS connection — before the
+	// next-tick publish completes, breaking the recurring chain.
 	job.mu.Lock()
 	job.lastRun = startTime
 	nextRun := job.schedule.Next(endTime)
 	job.nextRun = nextRun
-	job.running = false
 	job.mu.Unlock()
 
 	status := JobStatusCompleted
@@ -734,6 +737,13 @@ func (s *natsSchedulerImpl) executeJob(job *jobImpl, scheduledAt time.Time) {
 		status = JobStatusFailed
 		errorMsg = handlerErr.Error()
 	}
+
+	// Post-handler updates and the next-tick publish must outlive Stop()'s
+	// context cancellation. If we used s.ctx here, a SIGTERM mid-tick would
+	// silently fail to enqueue the next scheduled message and break the
+	// recurring chain until a peer restart triggers loadJobsFromKV.
+	postCtx, postCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer postCancel()
 
 	// Save execution record to KV (best-effort)
 	if s.execKV != nil {
@@ -748,7 +758,7 @@ func (s *natsSchedulerImpl) executeJob(job *jobImpl, scheduledAt time.Time) {
 			Metadata:    copyMetadata(metadata),
 		}
 		data, _ := json.Marshal(record)
-		_, _ = s.execKV.Put(s.ctx, executionID, data)
+		_, _ = s.execKV.Put(postCtx, executionID, data)
 	}
 
 	// Update job state in KV (best-effort)
@@ -765,13 +775,20 @@ func (s *natsSchedulerImpl) executeJob(job *jobImpl, scheduledAt time.Time) {
 			Metadata:       copyMetadata(metadata),
 		}
 		data, _ := json.Marshal(jv)
-		_, _ = s.jobKV.Put(s.ctx, job.id, data)
+		_, _ = s.jobKV.Put(postCtx, job.id, data)
 	}
 
 	// Schedule next execution (skip for one-time schedules)
 	if _, ok := currentSchedule.(*OnceSchedule); !ok {
-		_ = s.publishScheduledMessage(s.ctx, job.id, nextRun)
+		_ = s.publishScheduledMessage(postCtx, job.id, nextRun)
 	}
+
+	// Mark the job as no longer running only after all post-handler work is
+	// done. This is what makes waitForJobs() (and therefore Stop()) wait for
+	// the next-tick publish to complete.
+	job.mu.Lock()
+	job.running = false
+	job.mu.Unlock()
 }
 
 // publishScheduledMessage publishes a NATS message with scheduled delivery header.
