@@ -35,6 +35,20 @@ const (
 	// message; a wide window keeps the second-and-later copies suppressed
 	// even when peer restarts are spread out over hours.
 	defaultStreamDuplicatesWindow = 24 * time.Hour
+
+	// defaultPublishAttempts is the number of times executeJob retries the
+	// next-tick publishScheduledMessage call before giving up. The first
+	// attempt counts, so 3 = 1 initial + 2 retries.
+	defaultPublishAttempts = 3
+
+	// defaultPublishRetryBackoff is the wait before the second publish
+	// attempt; it doubles between each subsequent attempt.
+	defaultPublishRetryBackoff = time.Second
+
+	// defaultPostHandlerTimeout bounds the total time executeJob spends on
+	// post-handler work (KV updates + next-tick publish, including retries).
+	// Wider than the previous 10 s so the retry budget fits.
+	defaultPostHandlerTimeout = 60 * time.Second
 )
 
 // ErrNATSServerTooOld indicates the connected NATS server does not support
@@ -46,6 +60,24 @@ type scheduleMessage struct {
 	JobID       string    `json:"job_id"`
 	ScheduledAt time.Time `json:"scheduled_at"`
 }
+
+// NATSSchedulerLogger is a structured-log callback used to surface errors
+// from best-effort operations (KV writes, next-tick publishes, reconciler
+// scans). Arguments after msg are key/value pairs in the slog style.
+//
+// The scheduler invokes the logger from background goroutines; the callback
+// must be safe to call concurrently.
+type NATSSchedulerLogger func(msg string, keysAndValues ...any)
+
+// RescheduleFailureFunc is invoked when executeJob has run the handler
+// successfully (or with error) but failed to enqueue the next-tick scheduled
+// message even after retries. It is the hook callers use to plug in a
+// dead-letter or out-of-band reconciler. nextRun is the scheduled time of
+// the publish that failed.
+//
+// Invoked from a background goroutine; the callback must be safe to call
+// concurrently and should not block for long.
+type RescheduleFailureFunc func(jobID string, nextRun time.Time, err error)
 
 // NATSSchedulerOption configures a natsSchedulerImpl instance.
 type NATSSchedulerOption func(*natsSchedulerImpl)
@@ -123,6 +155,73 @@ func WithStreamDuplicatesWindow(window time.Duration) NATSSchedulerOption {
 	}
 }
 
+// WithNATSSchedulerLogger installs a logger called when the scheduler hits a
+// non-fatal error in a best-effort path (KV puts, next-tick publishes, and
+// the reconciler). Without this option, those errors are dropped silently.
+func WithNATSSchedulerLogger(logger NATSSchedulerLogger) NATSSchedulerOption {
+	return func(s *natsSchedulerImpl) {
+		s.logger = logger
+	}
+}
+
+// WithOnReschedulingFailed installs a callback invoked when executeJob fails
+// to enqueue the next-tick scheduled message after exhausting retries.
+// Callers can use this to record a dead-letter, page on-call, or trigger an
+// external reconciler. Without this option, the failure is logged (if a
+// logger is configured) but otherwise silently absorbed.
+func WithOnReschedulingFailed(fn RescheduleFailureFunc) NATSSchedulerOption {
+	return func(s *natsSchedulerImpl) {
+		s.onRescheduleFailed = fn
+	}
+}
+
+// WithPublishRetry configures how many times executeJob retries the
+// next-tick publishScheduledMessage call when it fails, and the backoff
+// between attempts (doubling between each attempt). attempts < 1 is treated
+// as 1 (no retry).
+func WithPublishRetry(attempts int, initialBackoff time.Duration) NATSSchedulerOption {
+	return func(s *natsSchedulerImpl) {
+		if attempts < 1 {
+			attempts = 1
+		}
+		if initialBackoff <= 0 {
+			initialBackoff = defaultPublishRetryBackoff
+		}
+		s.publishAttempts = attempts
+		s.publishRetryBackoff = initialBackoff
+	}
+}
+
+// WithReconcilerInterval enables a background goroutine that periodically
+// scans the job KV and republishes the scheduled message for any recurring
+// job whose NextRun is more than the supplied grace period in the past.
+//
+// Combined with the stream's Duplicates window and the deterministic
+// Nats-Msg-Id used by publishScheduledMessage, republishing is safe even
+// when the original scheduled message is still alive in the stream: the
+// duplicate is silently suppressed.
+//
+// interval <= 0 disables the reconciler (the default). A typical setting is
+// one full schedule interval (e.g. 1m for a minute-granularity cron).
+func WithReconcilerInterval(interval time.Duration) NATSSchedulerOption {
+	return func(s *natsSchedulerImpl) {
+		s.reconcilerInterval = interval
+	}
+}
+
+// WithReconcilerGracePeriod sets the lag tolerance the reconciler applies
+// before treating a job as stuck. A job is republished only if its KV
+// NextRun is older than now - gracePeriod. The default is 30 s, large enough
+// to skip jobs that are mid-tick yet small enough to recover quickly.
+func WithReconcilerGracePeriod(gracePeriod time.Duration) NATSSchedulerOption {
+	return func(s *natsSchedulerImpl) {
+		if gracePeriod < 0 {
+			gracePeriod = 0
+		}
+		s.reconcilerGrace = gracePeriod
+	}
+}
+
 // natsSchedulerImpl implements the Scheduler interface using NATS JetStream.
 // It uses JetStream scheduled message delivery (AllowMsgSchedules, NATS 2.12+)
 // for triggering jobs, and JetStream KV Store for persisting job metadata
@@ -150,6 +249,16 @@ type natsSchedulerImpl struct {
 
 	skipStartupCleanup bool
 	duplicatesWindow   time.Duration
+
+	logger              NATSSchedulerLogger
+	onRescheduleFailed  RescheduleFailureFunc
+	publishAttempts     int
+	publishRetryBackoff time.Duration
+	postHandlerTimeout  time.Duration
+
+	reconcilerInterval time.Duration
+	reconcilerGrace    time.Duration
+	reconcilerWG       sync.WaitGroup
 }
 
 // NewNATSScheduler creates a new Scheduler backed by NATS JetStream.
@@ -168,17 +277,21 @@ type natsSchedulerImpl struct {
 //	s.Start(ctx)
 func NewNATSScheduler(js jetstream.JetStream, handler JobHandler, opts ...NATSSchedulerOption) Scheduler {
 	s := &natsSchedulerImpl{
-		jobs:             make(map[string]*jobImpl),
-		handler:          handler,
-		codec:            NewBasicScheduleCodec(),
-		js:               js,
-		startReady:       make(chan struct{}),
-		streamName:       defaultNATSStreamName,
-		subjectPrefix:    defaultNATSSubjectPrefix,
-		consumerName:     defaultNATSConsumerName,
-		jobBucket:        defaultNATSJobBucket,
-		execBucket:       defaultNATSExecBucket,
-		duplicatesWindow: defaultStreamDuplicatesWindow,
+		jobs:                make(map[string]*jobImpl),
+		handler:             handler,
+		codec:               NewBasicScheduleCodec(),
+		js:                  js,
+		startReady:          make(chan struct{}),
+		streamName:          defaultNATSStreamName,
+		subjectPrefix:       defaultNATSSubjectPrefix,
+		consumerName:        defaultNATSConsumerName,
+		jobBucket:           defaultNATSJobBucket,
+		execBucket:          defaultNATSExecBucket,
+		duplicatesWindow:    defaultStreamDuplicatesWindow,
+		publishAttempts:     defaultPublishAttempts,
+		publishRetryBackoff: defaultPublishRetryBackoff,
+		postHandlerTimeout:  defaultPostHandlerTimeout,
+		reconcilerGrace:     30 * time.Second,
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -278,6 +391,13 @@ func (s *natsSchedulerImpl) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to start consuming: %w", err)
 	}
 
+	// Start the optional background reconciler. It runs until s.ctx is
+	// cancelled by Stop(), and Stop() waits for it via s.reconcilerWG.
+	if s.reconcilerInterval > 0 {
+		s.reconcilerWG.Add(1)
+		go s.runReconciler(s.ctx, s.reconcilerInterval)
+	}
+
 	ready := s.startReady
 	close(ready)
 
@@ -302,6 +422,10 @@ func (s *natsSchedulerImpl) Stop(ctx context.Context) error {
 		s.cancel()
 	}
 	s.mu.Unlock()
+
+	// Wait for the reconciler goroutine to exit before declaring stopped, so
+	// it does not race with a subsequent Start() on the same instance.
+	s.reconcilerWG.Wait()
 
 	// Wait for all running jobs to complete
 	s.waitForJobs()
@@ -742,7 +866,7 @@ func (s *natsSchedulerImpl) executeJob(job *jobImpl, scheduledAt time.Time) {
 	// context cancellation. If we used s.ctx here, a SIGTERM mid-tick would
 	// silently fail to enqueue the next scheduled message and break the
 	// recurring chain until a peer restart triggers loadJobsFromKV.
-	postCtx, postCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	postCtx, postCancel := context.WithTimeout(context.Background(), s.postHandlerTimeout)
 	defer postCancel()
 
 	// Save execution record to KV (best-effort)
@@ -758,29 +882,52 @@ func (s *natsSchedulerImpl) executeJob(job *jobImpl, scheduledAt time.Time) {
 			Metadata:    copyMetadata(metadata),
 		}
 		data, _ := json.Marshal(record)
-		_, _ = s.execKV.Put(postCtx, executionID, data)
+		if _, err := s.execKV.Put(postCtx, executionID, data); err != nil {
+			s.logError("failed to persist execution record",
+				"job_id", job.id, "execution_id", executionID, "err", err)
+		}
+	}
+
+	// Schedule next execution (skip for one-time schedules) before the
+	// final KV state write so the persisted Status accurately reflects
+	// whether the next-tick publish succeeded.
+	publishErr := error(nil)
+	if _, ok := currentSchedule.(*OnceSchedule); !ok {
+		publishErr = s.publishScheduledMessageWithRetry(postCtx, job.id, nextRun)
+		if publishErr != nil {
+			s.logError("failed to publish next-tick scheduled message",
+				"job_id", job.id, "next_run", nextRun, "err", publishErr)
+			if s.onRescheduleFailed != nil {
+				go s.onRescheduleFailed(job.id, nextRun, publishErr)
+			}
+		}
 	}
 
 	// Update job state in KV (best-effort)
 	if s.jobKV != nil {
+		// JobStatusReschedulingFailed is reserved for the "handler succeeded
+		// but we couldn't enqueue the next tick" case; when the handler
+		// itself failed, the handler error remains the primary signal.
+		finalStatus := status
+		if publishErr != nil && handlerErr == nil {
+			finalStatus = JobStatusReschedulingFailed
+		}
 		scheduleType, scheduleConfig, _ := s.codec.Encode(currentSchedule)
 		jv := &natsJobValue{
 			ID:             job.id,
 			ScheduleType:   scheduleType,
 			ScheduleConfig: scheduleConfig,
-			Status:         string(status),
+			Status:         string(finalStatus),
 			NextRun:        nextRun,
 			LastRun:        startTime,
 			UpdatedAt:      endTime,
 			Metadata:       copyMetadata(metadata),
 		}
 		data, _ := json.Marshal(jv)
-		_, _ = s.jobKV.Put(postCtx, job.id, data)
-	}
-
-	// Schedule next execution (skip for one-time schedules)
-	if _, ok := currentSchedule.(*OnceSchedule); !ok {
-		_ = s.publishScheduledMessage(postCtx, job.id, nextRun)
+		if _, err := s.jobKV.Put(postCtx, job.id, data); err != nil {
+			s.logError("failed to persist job state",
+				"job_id", job.id, "next_run", nextRun, "err", err)
+		}
 	}
 
 	// Mark the job as no longer running only after all post-handler work is
@@ -789,6 +936,164 @@ func (s *natsSchedulerImpl) executeJob(job *jobImpl, scheduledAt time.Time) {
 	job.mu.Lock()
 	job.running = false
 	job.mu.Unlock()
+}
+
+// runReconciler periodically scans the job KV and republishes the scheduled
+// message for any recurring job whose KV NextRun is older than the grace
+// period. Safe to run concurrently with executeJob and other peers: the
+// per-message Nats-Msg-Id (jobID, scheduledAt) combined with the stream's
+// Duplicates window suppresses the republish when the original scheduled
+// message is still alive. When the chain is genuinely broken (the next-tick
+// publish failed silently), the republish restores it.
+func (s *natsSchedulerImpl) runReconciler(ctx context.Context, interval time.Duration) {
+	defer s.reconcilerWG.Done()
+
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			s.reconcileOnce(ctx)
+		}
+	}
+}
+
+// reconcileOnce performs a single reconciliation sweep over the KV. Exposed
+// for tests; production callers should use runReconciler.
+func (s *natsSchedulerImpl) reconcileOnce(ctx context.Context) {
+	if s.jobKV == nil {
+		return
+	}
+	if err := ctx.Err(); err != nil {
+		return
+	}
+	keys, err := s.jobKV.Keys(ctx)
+	if err != nil {
+		if errors.Is(err, jetstream.ErrNoKeysFound) {
+			return
+		}
+		// Suppress the log line when the only reason Keys failed is that
+		// Stop() cancelled the context — that's expected, not an incident.
+		if ctx.Err() == nil {
+			s.logError("reconciler: list KV keys failed", "err", err)
+		}
+		return
+	}
+
+	grace := s.reconcilerGrace
+	if grace < 0 {
+		grace = 0
+	}
+	cutoff := time.Now().Add(-grace)
+
+	for _, key := range keys {
+		if err := ctx.Err(); err != nil {
+			return
+		}
+		entry, err := s.jobKV.Get(ctx, key)
+		if err != nil {
+			s.logError("reconciler: read KV entry failed", "key", key, "err", err)
+			continue
+		}
+		var jv natsJobValue
+		if err := json.Unmarshal(entry.Value(), &jv); err != nil {
+			s.logError("reconciler: decode KV entry failed", "key", key, "err", err)
+			continue
+		}
+		schedule, err := s.codec.Decode(jv.ScheduleType, jv.ScheduleConfig)
+		if err != nil {
+			s.logError("reconciler: decode schedule failed",
+				"job_id", jv.ID, "schedule_type", jv.ScheduleType, "err", err)
+			continue
+		}
+		// One-time schedules don't form a chain; nothing to repair.
+		if _, ok := schedule.(*OnceSchedule); ok {
+			continue
+		}
+		// Skip jobs we know are mid-tick locally — executeJob will publish
+		// the next-tick message itself.
+		s.mu.RLock()
+		local, hasLocal := s.jobs[jv.ID]
+		s.mu.RUnlock()
+		if hasLocal && local.IsRunning() {
+			continue
+		}
+		// NextRun in the future (or only marginally in the past) means the
+		// chain is intact — leave it alone.
+		if jv.NextRun.IsZero() || jv.NextRun.After(cutoff) {
+			continue
+		}
+
+		// Republish with the EXACT KV NextRun so the deterministic Msg-Id
+		// matches the original publish. If that original is still alive in
+		// the stream (i.e. the chain was actually fine and KV is just lagging
+		// our peer), the Duplicates window suppresses this republish.
+		if err := s.publishScheduledMessage(ctx, jv.ID, jv.NextRun); err != nil {
+			// Same shutdown-noise suppression as the Keys() path above.
+			if ctx.Err() == nil {
+				s.logError("reconciler: republish failed",
+					"job_id", jv.ID, "next_run", jv.NextRun, "err", err)
+			}
+			continue
+		}
+		s.logError("reconciler: republished stale next-tick",
+			"job_id", jv.ID, "next_run", jv.NextRun)
+	}
+}
+
+// logError forwards a structured error event to the configured logger.
+// Safe to call from any goroutine; no-op when no logger is installed.
+func (s *natsSchedulerImpl) logError(msg string, keysAndValues ...any) {
+	if s.logger == nil {
+		return
+	}
+	defer func() {
+		// A panicking logger must not crash a scheduler goroutine.
+		_ = recover()
+	}()
+	s.logger(msg, keysAndValues...)
+}
+
+// publishScheduledMessageWithRetry retries publishScheduledMessage with
+// bounded exponential backoff. The first attempt counts toward the budget,
+// so attempts = 3 means 1 initial + 2 retries.
+func (s *natsSchedulerImpl) publishScheduledMessageWithRetry(ctx context.Context, jobID string, scheduledAt time.Time) error {
+	attempts := s.publishAttempts
+	if attempts < 1 {
+		attempts = 1
+	}
+	backoff := s.publishRetryBackoff
+	if backoff <= 0 {
+		backoff = defaultPublishRetryBackoff
+	}
+
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		if err := ctx.Err(); err != nil {
+			if lastErr == nil {
+				lastErr = err
+			}
+			return lastErr
+		}
+		lastErr = s.publishScheduledMessage(ctx, jobID, scheduledAt)
+		if lastErr == nil {
+			return nil
+		}
+		if i == attempts-1 {
+			break
+		}
+		s.logError("publishScheduledMessage attempt failed; retrying",
+			"job_id", jobID, "attempt", i+1, "next_run", scheduledAt, "err", lastErr)
+		select {
+		case <-ctx.Done():
+			return lastErr
+		case <-time.After(backoff):
+		}
+		backoff *= 2
+	}
+	return lastErr
 }
 
 // publishScheduledMessage publishes a NATS message with scheduled delivery header.
@@ -867,16 +1172,22 @@ func (s *natsSchedulerImpl) loadJobsFromKV(ctx context.Context) error {
 	for _, key := range keys {
 		entry, err := s.jobKV.Get(ctx, key)
 		if err != nil {
+			s.logError("startup: failed to read job KV entry",
+				"key", key, "err", err)
 			continue
 		}
 
 		var jv natsJobValue
 		if err := json.Unmarshal(entry.Value(), &jv); err != nil {
+			s.logError("startup: failed to decode job KV entry",
+				"key", key, "err", err)
 			continue
 		}
 
 		schedule, err := s.codec.Decode(jv.ScheduleType, jv.ScheduleConfig)
 		if err != nil {
+			s.logError("startup: failed to decode schedule",
+				"job_id", jv.ID, "schedule_type", jv.ScheduleType, "err", err)
 			continue
 		}
 
@@ -910,7 +1221,10 @@ func (s *natsSchedulerImpl) loadJobsFromKV(ctx context.Context) error {
 		}
 		s.jobs[jv.ID] = job
 
-		_ = s.publishScheduledMessage(ctx, jv.ID, nextRun)
+		if err := s.publishScheduledMessage(ctx, jv.ID, nextRun); err != nil {
+			s.logError("startup: failed to publish scheduled message",
+				"job_id", jv.ID, "next_run", nextRun, "err", err)
+		}
 	}
 
 	return nil

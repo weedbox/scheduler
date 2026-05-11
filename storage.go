@@ -46,6 +46,11 @@ const (
 	// JobStatusFailed indicates the job execution failed
 	JobStatusFailed JobStatus = "failed"
 
+	// JobStatusReschedulingFailed indicates the handler completed but the
+	// scheduler failed to enqueue the next-tick scheduled message. Distinct
+	// from JobStatusFailed so observability can tell the two apart.
+	JobStatusReschedulingFailed JobStatus = "rescheduling_failed"
+
 	// JobStatusDisabled indicates the job is disabled
 	JobStatusDisabled JobStatus = "disabled"
 )
