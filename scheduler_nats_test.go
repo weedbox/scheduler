@@ -782,6 +782,81 @@ func TestNATSScheduler_PublishRetryHelperRetries(t *testing.T) {
 		"expected retry log lines between attempts, got %d", logCount.Load())
 }
 
+// TestNATSScheduler_WaitForBackingStreams_ReadyImmediately covers the
+// single-node path: StreamInfo.Cluster is nil, so the wait returns at
+// once without burning the timeout.
+func TestNATSScheduler_WaitForBackingStreams_ReadyImmediately(t *testing.T) {
+	_, js := startNATSServer(t)
+
+	s := NewNATSScheduler(js, func(ctx context.Context, e JobEvent) error { return nil },
+		WithNATSStreamName("READY_TEST"),
+		WithNATSSubjectPrefix("ready"),
+		WithNATSConsumerName("ready-worker"),
+		WithNATSSchedulerJobBucket("READY_JOBS"),
+		WithNATSSchedulerExecBucket("READY_EXECS"),
+	).(*natsSchedulerImpl)
+
+	ctx := context.Background()
+	require.NoError(t, s.Start(ctx))
+	defer s.Stop(ctx)
+
+	start := time.Now()
+	err := s.waitForBackingStreams(ctx, 5*time.Second)
+	elapsed := time.Since(start)
+
+	assert.NoError(t, err)
+	assert.Less(t, elapsed, 500*time.Millisecond,
+		"single-node should be ready instantly, took %s", elapsed)
+}
+
+// TestNATSScheduler_WaitForBackingStreams_TimeoutsOnUnreachable verifies the
+// wait actually errors out when the JetStream API is unreachable rather
+// than blocking indefinitely.
+func TestNATSScheduler_WaitForBackingStreams_TimeoutsOnUnreachable(t *testing.T) {
+	ns, js := startNATSServer(t)
+
+	s := NewNATSScheduler(js, func(ctx context.Context, e JobEvent) error { return nil },
+		WithNATSStreamName("TIMEOUT_TEST"),
+		WithNATSSubjectPrefix("timeout_test"),
+		WithNATSConsumerName("timeout-worker"),
+		WithNATSSchedulerJobBucket("TIMEOUT_JOBS"),
+		WithNATSSchedulerExecBucket("TIMEOUT_EXECS"),
+	).(*natsSchedulerImpl)
+
+	ctx := context.Background()
+	require.NoError(t, s.Start(ctx))
+	t.Cleanup(func() { _ = s.Stop(context.Background()) })
+
+	// Take the server down so every Info() call fails.
+	ns.Shutdown()
+	ns.WaitForShutdown()
+
+	start := time.Now()
+	err := s.waitForBackingStreams(ctx, 300*time.Millisecond)
+	elapsed := time.Since(start)
+
+	assert.Error(t, err)
+	assert.Less(t, elapsed, 3*time.Second,
+		"wait should respect the timeout, took %s", elapsed)
+}
+
+// TestNATSScheduler_StartupReadyTimeoutDisabled verifies that passing 0
+// disables the wait entirely.
+func TestNATSScheduler_StartupReadyTimeoutDisabled(t *testing.T) {
+	_, js := startNATSServer(t)
+
+	s := NewNATSScheduler(js, func(ctx context.Context, e JobEvent) error { return nil },
+		WithStartupStreamReadyTimeout(0),
+	).(*natsSchedulerImpl)
+
+	assert.Equal(t, time.Duration(0), s.startupStreamReadyTimeout)
+
+	// And Start still succeeds with the wait turned off.
+	ctx := context.Background()
+	require.NoError(t, s.Start(ctx))
+	defer s.Stop(ctx)
+}
+
 // TestNATSScheduler_ReschedulingFailedStatus verifies that when the
 // next-tick publish ultimately fails, the persisted job Status reflects
 // JobStatusReschedulingFailed rather than the handler's status.

@@ -49,6 +49,15 @@ const (
 	// post-handler work (KV updates + next-tick publish, including retries).
 	// Wider than the previous 10 s so the retry budget fits.
 	defaultPostHandlerTimeout = 60 * time.Second
+
+	// defaultStartupStreamReadyTimeout bounds how long Start() waits for the
+	// SCHEDULER stream and the KV backing streams to have a raft leader
+	// before continuing to loadJobsFromKV. In multi-node JetStream clusters
+	// CreateOrUpdateStream / CreateOrUpdateKeyValue return as soon as the
+	// metaleader has accepted the config, so the asset's own raft group may
+	// still be electing a leader — any publish/KV call issued in that
+	// window returns nats: no responders available for request.
+	defaultStartupStreamReadyTimeout = 30 * time.Second
 )
 
 // ErrNATSServerTooOld indicates the connected NATS server does not support
@@ -209,6 +218,27 @@ func WithReconcilerInterval(interval time.Duration) NATSSchedulerOption {
 	}
 }
 
+// WithStartupStreamReadyTimeout bounds how long Start() waits for the
+// SCHEDULER stream and KV backing streams to have a raft leader before
+// proceeding to load persisted jobs.
+//
+// In multi-node JetStream clusters, CreateOrUpdateStream and
+// CreateOrUpdateKeyValue return as soon as the metaleader has accepted the
+// config — the asset's own raft group may still be electing a leader, so a
+// publishScheduledMessage or KV Keys/Get call issued in that window returns
+// nats: no responders available for request. Without this wait,
+// loadJobsFromKV would silently or noisily drop the first startup publish
+// for every persisted job until the chain naturally re-fires (it doesn't,
+// because the chain is the publish we just lost).
+//
+// timeout <= 0 disables the wait. Single-node JetStream (no Cluster info)
+// is treated as ready immediately.
+func WithStartupStreamReadyTimeout(timeout time.Duration) NATSSchedulerOption {
+	return func(s *natsSchedulerImpl) {
+		s.startupStreamReadyTimeout = timeout
+	}
+}
+
 // WithReconcilerGracePeriod sets the lag tolerance the reconciler applies
 // before treating a job as stuck. A job is republished only if its KV
 // NextRun is older than now - gracePeriod. The default is 30 s, large enough
@@ -250,11 +280,12 @@ type natsSchedulerImpl struct {
 	skipStartupCleanup bool
 	duplicatesWindow   time.Duration
 
-	logger              NATSSchedulerLogger
-	onRescheduleFailed  RescheduleFailureFunc
-	publishAttempts     int
-	publishRetryBackoff time.Duration
-	postHandlerTimeout  time.Duration
+	logger                    NATSSchedulerLogger
+	onRescheduleFailed        RescheduleFailureFunc
+	publishAttempts           int
+	publishRetryBackoff       time.Duration
+	postHandlerTimeout        time.Duration
+	startupStreamReadyTimeout time.Duration
 
 	reconcilerInterval time.Duration
 	reconcilerGrace    time.Duration
@@ -288,10 +319,11 @@ func NewNATSScheduler(js jetstream.JetStream, handler JobHandler, opts ...NATSSc
 		jobBucket:           defaultNATSJobBucket,
 		execBucket:          defaultNATSExecBucket,
 		duplicatesWindow:    defaultStreamDuplicatesWindow,
-		publishAttempts:     defaultPublishAttempts,
-		publishRetryBackoff: defaultPublishRetryBackoff,
-		postHandlerTimeout:  defaultPostHandlerTimeout,
-		reconcilerGrace:     30 * time.Second,
+		publishAttempts:           defaultPublishAttempts,
+		publishRetryBackoff:       defaultPublishRetryBackoff,
+		postHandlerTimeout:        defaultPostHandlerTimeout,
+		startupStreamReadyTimeout: defaultStartupStreamReadyTimeout,
+		reconcilerGrace:           30 * time.Second,
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -354,6 +386,17 @@ func (s *natsSchedulerImpl) Start(ctx context.Context) error {
 	if info := s.stream.CachedInfo(); info != nil && !info.Config.AllowMsgSchedules {
 		return fmt.Errorf("%w: server %s accepted the stream but did not enable AllowMsgSchedules",
 			ErrNATSServerTooOld, s.js.Conn().ConnectedServerVersion())
+	}
+
+	// Wait for the SCHEDULER stream and KV backing streams to have a raft
+	// leader before any publish or KV operation. Without this, multi-node
+	// clusters return nats: no responders available for request during the
+	// election window — silently dropping the first startup publish for
+	// every persisted job until a peer restart.
+	if s.startupStreamReadyTimeout > 0 {
+		if err := s.waitForBackingStreams(ctx, s.startupStreamReadyTimeout); err != nil {
+			return fmt.Errorf("backing streams not ready: %w", err)
+		}
 	}
 
 	if !s.skipStartupCleanup {
@@ -936,6 +979,96 @@ func (s *natsSchedulerImpl) executeJob(job *jobImpl, scheduledAt time.Time) {
 	job.mu.Lock()
 	job.running = false
 	job.mu.Unlock()
+}
+
+// waitForBackingStreams blocks until the SCHEDULER stream and both KV
+// backing streams (KV_<jobBucket>, KV_<execBucket>) report a raft leader,
+// or the timeout elapses. Single-node JetStream (where StreamInfo.Cluster
+// is nil) is treated as ready immediately.
+//
+// The poll catches three failure modes for a freshly-created asset in a
+// multi-node cluster:
+//   - stream.Info / js.Stream returns nats: no responders (asset stream not
+//     yet hosted on any peer that responds);
+//   - StreamInfo.Cluster.Leader == "" (raft group still electing);
+//   - the call itself errors with a transient JetStream API error.
+//
+// In each case the probe is retried with bounded exponential backoff.
+func (s *natsSchedulerImpl) waitForBackingStreams(ctx context.Context, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+
+	type target struct {
+		label string
+		info  func(context.Context) (*jetstream.StreamInfo, error)
+	}
+	targets := []target{
+		{
+			label: s.streamName,
+			info:  func(c context.Context) (*jetstream.StreamInfo, error) { return s.stream.Info(c) },
+		},
+	}
+	if s.jobKV != nil {
+		jobStreamName := "KV_" + s.jobBucket
+		targets = append(targets, target{
+			label: jobStreamName,
+			info: func(c context.Context) (*jetstream.StreamInfo, error) {
+				st, err := s.js.Stream(c, jobStreamName)
+				if err != nil {
+					return nil, err
+				}
+				return st.Info(c)
+			},
+		})
+	}
+	if s.execKV != nil {
+		execStreamName := "KV_" + s.execBucket
+		targets = append(targets, target{
+			label: execStreamName,
+			info: func(c context.Context) (*jetstream.StreamInfo, error) {
+				st, err := s.js.Stream(c, execStreamName)
+				if err != nil {
+					return nil, err
+				}
+				return st.Info(c)
+			},
+		})
+	}
+
+	for _, t := range targets {
+		backoff := 50 * time.Millisecond
+		for {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				return fmt.Errorf("%s: no raft leader after %s", t.label, timeout)
+			}
+			// Cap each probe so a hung JetStream API request can't blow
+			// past the overall deadline. 2 s is enough for a healthy
+			// cluster and short enough that the retry loop stays responsive.
+			callTimeout := 2 * time.Second
+			if callTimeout > remaining {
+				callTimeout = remaining
+			}
+			infoCtx, infoCancel := context.WithTimeout(ctx, callTimeout)
+			info, err := t.info(infoCtx)
+			infoCancel()
+			if err == nil && (info.Cluster == nil || info.Cluster.Leader != "") {
+				break
+			}
+
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(backoff):
+			}
+			if backoff < 500*time.Millisecond {
+				backoff *= 2
+			}
+		}
+	}
+	return nil
 }
 
 // runReconciler periodically scans the job KV and republishes the scheduled
