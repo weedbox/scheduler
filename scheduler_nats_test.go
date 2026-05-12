@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -857,6 +858,391 @@ func TestNATSScheduler_StartupReadyTimeoutDisabled(t *testing.T) {
 	defer s.Stop(ctx)
 }
 
+// TestNATSScheduler_DropsStaleStreamMessageByKVValidation verifies that a
+// stream message whose scheduledAt is older than the KV-authoritative
+// NextRun is acked and dropped by handleMessage rather than re-invoking
+// the handler. This is the cross-peer dedup that replaces the in-memory
+// lastRun check.
+func TestNATSScheduler_DropsStaleStreamMessageByKVValidation(t *testing.T) {
+	_, js := startNATSServer(t)
+
+	var count atomic.Int32
+	handler := func(ctx context.Context, e JobEvent) error {
+		count.Add(1)
+		return nil
+	}
+
+	s := NewNATSScheduler(js, handler,
+		WithNATSStreamName("STALE_KV_TEST"),
+		WithNATSSubjectPrefix("stale_kv"),
+		WithNATSConsumerName("stale-kv-worker"),
+		WithNATSSchedulerJobBucket("STALE_KV_JOBS"),
+		WithNATSSchedulerExecBucket("STALE_KV_EXECS"),
+		WithReconcilerInterval(0), // off so it doesn't republish underneath us
+	).(*natsSchedulerImpl)
+
+	ctx := context.Background()
+	require.NoError(t, s.Start(ctx))
+	defer s.Stop(ctx)
+
+	// Seed KV with a job whose NextRun is well in the future. The seed value
+	// represents the cross-peer "authoritative" state that handleMessage will
+	// consult when a stale msg lands.
+	farFutureNext := time.Now().Add(1 * time.Hour)
+	jv := &natsJobValue{
+		ID:             "stale-kv-job",
+		ScheduleType:   "interval",
+		ScheduleConfig: "1h",
+		Status:         string(JobStatusPending),
+		NextRun:        farFutureNext,
+	}
+	data, err := json.Marshal(jv)
+	require.NoError(t, err)
+	_, err = s.jobKV.Put(ctx, "stale-kv-job", data)
+	require.NoError(t, err)
+
+	// Inject a stale msg with scheduledAt much earlier than KV.NextRun.
+	// Use a near-future time so JetStream actually delivers it inside the
+	// test window.
+	staleAt := time.Now().Add(100 * time.Millisecond)
+	require.NoError(t, s.publishScheduledMessage(ctx, "stale-kv-job", staleAt))
+
+	// Wait long enough that the stale msg's scheduledAt has passed and
+	// JetStream has had a chance to deliver and have us drop it.
+	time.Sleep(2 * time.Second)
+
+	assert.Equal(t, int32(0), count.Load(),
+		"stale stream message (scheduledAt < KV.NextRun) should be dropped, got %d executions", count.Load())
+}
+
+// TestNATSScheduler_BrandNewJobNoRapidFireOnRestart covers the "AddJob then
+// crash before fire, then restart later" scenario:
+//
+//   - Time T0: AddJob with interval 5s. KV is written with NextRun=T0+5s,
+//     LastRun=zero. The first scheduled msg (scheduledAt=T0+5s) is published.
+//   - Time T0+~0s: scheduler stops. Stale msg still sits in the stream.
+//   - Time T0+6s (past the original scheduledAt): restart. loadJobsFromKV
+//     sees NextRun=T0+5s already in the past, recomputes it to T0+11s, writes
+//     the new NextRun back to KV, and publishes a fresh msg with the new
+//     scheduledAt.
+//
+// Without the KV-NextRun validation (and the KV write-back in loadJobsFromKV),
+// the stale T0+5s msg would be delivered immediately on restart and fire,
+// producing a spurious first execution before the legitimate T0+11s tick.
+//
+// The assertion window (T0+6s..T0+8s) sits BETWEEN restart and the legit
+// fire, so any execution in that window must be from a stale msg.
+func TestNATSScheduler_BrandNewJobNoRapidFireOnRestart(t *testing.T) {
+	_, js := startNATSServer(t)
+
+	var count atomic.Int32
+	handler := func(ctx context.Context, e JobEvent) error {
+		count.Add(1)
+		return nil
+	}
+
+	opts := []NATSSchedulerOption{
+		WithNATSStreamName("BRAND_NEW_TEST"),
+		WithNATSSubjectPrefix("brand_new"),
+		WithNATSConsumerName("brand-new-worker"),
+		WithNATSSchedulerJobBucket("BRAND_NEW_JOBS"),
+		WithNATSSchedulerExecBucket("BRAND_NEW_EXECS"),
+		WithReconcilerInterval(0),
+	}
+
+	ctx := context.Background()
+	s1 := NewNATSScheduler(js, handler, opts...)
+	require.NoError(t, s1.Start(ctx))
+
+	schedule, err := NewIntervalSchedule(5 * time.Second)
+	require.NoError(t, err)
+	require.NoError(t, s1.AddJob("brand-new-job", schedule, nil))
+
+	// Stop immediately so the first scheduled msg doesn't fire.
+	require.NoError(t, s1.Stop(ctx))
+
+	// Wait past the original scheduledAt so loadJobsFromKV must recompute
+	// NextRun forward on restart.
+	time.Sleep(6 * time.Second)
+
+	s2 := NewNATSScheduler(js, handler, opts...)
+	require.NoError(t, s2.Start(ctx))
+	defer s2.Stop(ctx)
+
+	// Watch the window that sits BEFORE the legit T+11s fire. Any execution
+	// here must come from the stale msg — which the KV validation should drop.
+	// 2s is plenty of time for the stale (past-dated) msg to be delivered.
+	time.Sleep(2 * time.Second)
+	assert.Equal(t, int32(0), count.Load(),
+		"stale msg from before restart must not fire; got %d executions in pre-tick window",
+		count.Load())
+
+	// Sanity check: the legit chain still fires. If we accidentally dropped
+	// the legit msg too, this would hang.
+	require.Eventually(t, func() bool {
+		return count.Load() >= 1
+	}, 6*time.Second, 50*time.Millisecond,
+		"legit recomputed tick should still fire after restart")
+}
+
+// TestNATSScheduler_NoStartupPurge verifies the design choice that Start()
+// no longer purges the stream or deletes the durable consumer. The stale
+// payload from a previous run should still be sitting in the stream after a
+// fresh Start() — the KV validation in handleMessage is what filters it.
+func TestNATSScheduler_NoStartupPurge(t *testing.T) {
+	_, js := startNATSServer(t)
+
+	handler := func(ctx context.Context, e JobEvent) error { return nil }
+
+	opts := []NATSSchedulerOption{
+		WithNATSStreamName("NO_PURGE_TEST"),
+		WithNATSSubjectPrefix("no_purge"),
+		WithNATSConsumerName("no-purge-worker"),
+		WithNATSSchedulerJobBucket("NO_PURGE_JOBS"),
+		WithNATSSchedulerExecBucket("NO_PURGE_EXECS"),
+		WithReconcilerInterval(0),
+	}
+
+	ctx := context.Background()
+	s1 := NewNATSScheduler(js, handler, opts...).(*natsSchedulerImpl)
+	require.NoError(t, s1.Start(ctx))
+
+	// Long interval so the published msg sits in the stream undelivered.
+	schedule, err := NewIntervalSchedule(1 * time.Hour)
+	require.NoError(t, err)
+	require.NoError(t, s1.AddJob("no-purge-job", schedule, nil))
+
+	// Confirm there's a msg in the stream.
+	info1, err := s1.stream.Info(ctx)
+	require.NoError(t, err)
+	require.Greater(t, info1.State.Msgs, uint64(0),
+		"expected at least one pending scheduled msg before stop")
+
+	require.NoError(t, s1.Stop(ctx))
+
+	// Restart. If the design were still purging on Start(), the stream
+	// message count would drop to 0 here.
+	s2 := NewNATSScheduler(js, handler, opts...).(*natsSchedulerImpl)
+	require.NoError(t, s2.Start(ctx))
+	defer s2.Stop(ctx)
+
+	info2, err := s2.stream.Info(ctx)
+	require.NoError(t, err)
+	assert.Greater(t, info2.State.Msgs, uint64(0),
+		"stream messages should survive restart (no startup purge), got %d msgs", info2.State.Msgs)
+}
+
+// TestNATSScheduler_LoadJobsFromKVWritebackCASLosesToRacer documents the
+// CAS-guarded writeback in loadJobsFromKV. When another writer (e.g. a peer's
+// executeJob completing mid-restart) bumps the KV revision between our Get
+// and Update, the Update must fail with ErrKeyExists so we skip the
+// writeback and preserve the racer's authoritative LastRun / Status / NextRun.
+//
+// This is a contract test for the jetstream KV API plus our error-detection
+// pattern (errors.Is(err, ErrKeyExists)); if the upstream library ever
+// changes how CAS mismatch surfaces, this test catches it before the
+// writeback silently regresses to a clobbering Put.
+func TestNATSScheduler_LoadJobsFromKVWritebackCASLosesToRacer(t *testing.T) {
+	_, js := startNATSServer(t)
+
+	s := NewNATSScheduler(js, func(ctx context.Context, e JobEvent) error { return nil },
+		WithNATSStreamName("CAS_TEST"),
+		WithNATSSubjectPrefix("cas"),
+		WithNATSConsumerName("cas-worker"),
+		WithNATSSchedulerJobBucket("CAS_JOBS"),
+		WithNATSSchedulerExecBucket("CAS_EXECS"),
+		WithReconcilerInterval(0),
+	).(*natsSchedulerImpl)
+
+	ctx := context.Background()
+	require.NoError(t, s.Start(ctx))
+	defer s.Stop(ctx)
+
+	// Seed an initial KV value.
+	originalNext := time.Now().Add(-1 * time.Hour) // in past, would trigger recompute
+	initial := &natsJobValue{
+		ID:             "race-job",
+		ScheduleType:   "interval",
+		ScheduleConfig: "1h",
+		Status:         string(JobStatusPending),
+		NextRun:        originalNext,
+	}
+	data, err := json.Marshal(initial)
+	require.NoError(t, err)
+	_, err = s.jobKV.Put(ctx, "race-job", data)
+	require.NoError(t, err)
+
+	// Capture the revision a hypothetical loadJobsFromKV would have read.
+	entry, err := s.jobKV.Get(ctx, "race-job")
+	require.NoError(t, err)
+	staleRevision := entry.Revision()
+
+	// Simulate a racing peer's executeJob completing: it writes a fresher
+	// NextRun + Status + LastRun. This bumps the revision past staleRevision.
+	racerLastRun := time.Now().Add(-30 * time.Minute)
+	racerNext := time.Now().Add(30 * time.Minute)
+	racer := *initial
+	racer.Status = string(JobStatusCompleted)
+	racer.LastRun = racerLastRun
+	racer.NextRun = racerNext
+	racerData, err := json.Marshal(&racer)
+	require.NoError(t, err)
+	_, err = s.jobKV.Put(ctx, "race-job", racerData)
+	require.NoError(t, err)
+
+	// Now mimic loadJobsFromKV's writeback path with the stale revision.
+	recomputed := *initial
+	recomputed.NextRun = time.Now().Add(1 * time.Hour)
+	recomputedData, err := json.Marshal(&recomputed)
+	require.NoError(t, err)
+	_, updateErr := s.jobKV.Update(ctx, "race-job", recomputedData, staleRevision)
+
+	require.Error(t, updateErr, "stale-revision Update must fail")
+	assert.True(t, errors.Is(updateErr, jetstream.ErrKeyExists),
+		"CAS mismatch must surface as ErrKeyExists, got %v", updateErr)
+
+	// KV must still carry the racer's value — no clobbering by the loser.
+	final, err := s.jobKV.Get(ctx, "race-job")
+	require.NoError(t, err)
+	var finalJV natsJobValue
+	require.NoError(t, json.Unmarshal(final.Value(), &finalJV))
+
+	assert.Equal(t, racerNext.Unix(), finalJV.NextRun.Unix(),
+		"racer's NextRun must be preserved")
+	assert.Equal(t, racerLastRun.Unix(), finalJV.LastRun.Unix(),
+		"racer's LastRun must be preserved")
+	assert.Equal(t, string(JobStatusCompleted), finalJV.Status,
+		"racer's Status must be preserved")
+}
+
+// TestNATSScheduler_DefaultReconcilerEnabled checks the changed default: the
+// background reconciler is now enabled out of the box, with a 30 s interval.
+func TestNATSScheduler_DefaultReconcilerEnabled(t *testing.T) {
+	_, js := startNATSServer(t)
+
+	s := NewNATSScheduler(js, func(ctx context.Context, e JobEvent) error { return nil }).(*natsSchedulerImpl)
+	assert.Equal(t, 30*time.Second, s.reconcilerInterval,
+		"reconciler should default to 30s")
+	assert.Equal(t, 5*time.Second, s.addJobRetryBudget,
+		"addJobRetryBudget should default to 5s")
+}
+
+// TestNATSScheduler_DoWithTransientRetryBehaviour exercises the new
+// doWithTransientRetry helper in isolation:
+//
+//   - succeeds eventually within the budget ➜ returns nil
+//   - always fails until the budget elapses ➜ returns the last error
+//   - context is cancelled before the budget elapses ➜ returns promptly
+//   - budget <= 0 ➜ single attempt, no retry
+func TestNATSScheduler_DoWithTransientRetryBehaviour(t *testing.T) {
+	_, js := startNATSServer(t)
+
+	s := NewNATSScheduler(js, func(ctx context.Context, e JobEvent) error { return nil }).(*natsSchedulerImpl)
+
+	// Case 1: succeed after a couple of transient failures.
+	var attempts atomic.Int32
+	err := s.doWithTransientRetry(context.Background(), 5*time.Second, func(ctx context.Context) error {
+		if attempts.Add(1) < 3 {
+			return errors.New("transient")
+		}
+		return nil
+	})
+	require.NoError(t, err)
+	assert.Equal(t, int32(3), attempts.Load())
+
+	// Case 2: always fail, budget exhausts, last error bubbles.
+	attempts.Store(0)
+	err = s.doWithTransientRetry(context.Background(), 250*time.Millisecond, func(ctx context.Context) error {
+		attempts.Add(1)
+		return errors.New("persistent")
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "persistent")
+	assert.Greater(t, attempts.Load(), int32(1), "expected more than one attempt")
+
+	// Case 3: cancelled context returns promptly.
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	start := time.Now()
+	err = s.doWithTransientRetry(cancelled, 5*time.Second, func(ctx context.Context) error {
+		return errors.New("should not even run")
+	})
+	elapsed := time.Since(start)
+	require.Error(t, err)
+	assert.Less(t, elapsed, 1*time.Second, "cancelled ctx should return quickly")
+
+	// Case 4: budget <= 0 means single attempt.
+	attempts.Store(0)
+	err = s.doWithTransientRetry(context.Background(), 0, func(ctx context.Context) error {
+		attempts.Add(1)
+		return errors.New("one shot")
+	})
+	require.Error(t, err)
+	assert.Equal(t, int32(1), attempts.Load(), "budget <= 0 should produce exactly one attempt")
+}
+
+// TestNATSScheduler_AddJobCreateAlreadyExistsTreatedAsSuccessWhenValueMatches
+// validates the dedup logic used by AddJob when KV.Create retries and the
+// previous attempt's write was the one that landed (the response packet was
+// what got dropped). Matching value -> treat as success; differing value
+// -> ErrJobAlreadyExists.
+func TestNATSScheduler_AddJobCreateAlreadyExistsTreatedAsSuccessWhenValueMatches(t *testing.T) {
+	_, js := startNATSServer(t)
+
+	s := NewNATSScheduler(js, func(ctx context.Context, e JobEvent) error { return nil },
+		WithNATSStreamName("CREATE_EXISTS_TEST"),
+		WithNATSSubjectPrefix("create_exists"),
+		WithNATSConsumerName("create-exists-worker"),
+		WithNATSSchedulerJobBucket("CREATE_EXISTS_JOBS"),
+		WithNATSSchedulerExecBucket("CREATE_EXISTS_EXECS"),
+		WithReconcilerInterval(0),
+	).(*natsSchedulerImpl)
+
+	ctx := context.Background()
+	require.NoError(t, s.Start(ctx))
+	defer s.Stop(ctx)
+
+	matchingData := []byte(`{"id":"foo","payload":"x"}`)
+	// Simulate the previous attempt's write having landed.
+	_, err := s.jobKV.Create(ctx, "foo", matchingData)
+	require.NoError(t, err)
+
+	// Re-run the create-then-compare logic with the same bytes. The Create
+	// call should fail with ErrKeyExists; the Get-and-compare branch should
+	// then swallow it as success.
+	err = s.doWithTransientRetry(ctx, time.Second, func(opCtx context.Context) error {
+		_, e := s.jobKV.Create(opCtx, "foo", matchingData)
+		if errors.Is(e, jetstream.ErrKeyExists) {
+			existing, getErr := s.jobKV.Get(opCtx, "foo")
+			if getErr == nil && bytes.Equal(existing.Value(), matchingData) {
+				return nil
+			}
+			return ErrJobAlreadyExists
+		}
+		return e
+	})
+	assert.NoError(t, err, "matching value should be treated as success")
+
+	// Now seed a different key with the original bytes, then attempt to
+	// create with a different value. The KV row already exists with the
+	// "wrong" bytes — that must surface as ErrJobAlreadyExists.
+	_, err = s.jobKV.Create(ctx, "bar", matchingData)
+	require.NoError(t, err)
+	differentData := []byte(`{"id":"bar","payload":"different"}`)
+	err = s.doWithTransientRetry(ctx, time.Second, func(opCtx context.Context) error {
+		_, e := s.jobKV.Create(opCtx, "bar", differentData)
+		if errors.Is(e, jetstream.ErrKeyExists) {
+			existing, getErr := s.jobKV.Get(opCtx, "bar")
+			if getErr == nil && bytes.Equal(existing.Value(), differentData) {
+				return nil
+			}
+			return ErrJobAlreadyExists
+		}
+		return e
+	})
+	assert.ErrorIs(t, err, ErrJobAlreadyExists, "differing value should yield ErrJobAlreadyExists")
+}
+
 // TestNATSScheduler_ReschedulingFailedStatus verifies that when the
 // next-tick publish ultimately fails, the persisted job Status reflects
 // JobStatusReschedulingFailed rather than the handler's status.
@@ -879,4 +1265,72 @@ func TestNATSScheduler_ReschedulingFailedStatus(t *testing.T) {
 	assert.Equal(t, JobStatus("rescheduling_failed"), JobStatusReschedulingFailed)
 	assert.NotEqual(t, JobStatusFailed, JobStatusReschedulingFailed)
 	assert.NotEqual(t, JobStatusCompleted, JobStatusReschedulingFailed)
+}
+
+// TestNATSScheduler_CreatedAtPreservedAcrossExecutionAndUpdate verifies that
+// the CreatedAt timestamp written by AddJob survives both the post-handler
+// KV write in executeJob and a subsequent UpdateJobSchedule. Earlier code
+// constructed natsJobValue without CreatedAt at both sites, silently
+// zeroing the stored timestamp on every execution.
+func TestNATSScheduler_CreatedAtPreservedAcrossExecutionAndUpdate(t *testing.T) {
+	_, js := startNATSServer(t)
+
+	fired := make(chan struct{}, 4)
+	s := NewNATSScheduler(js, func(ctx context.Context, e JobEvent) error {
+		select {
+		case fired <- struct{}{}:
+		default:
+		}
+		return nil
+	},
+		WithNATSStreamName("CREATEDAT_TEST"),
+		WithNATSSubjectPrefix("createdat_test"),
+		WithNATSConsumerName("createdat-worker"),
+		WithNATSSchedulerJobBucket("CREATEDAT_JOBS"),
+		WithNATSSchedulerExecBucket("CREATEDAT_EXECS"),
+	).(*natsSchedulerImpl)
+
+	ctx := context.Background()
+	require.NoError(t, s.Start(ctx))
+	defer s.Stop(ctx)
+
+	schedule, err := NewIntervalSchedule(500 * time.Millisecond)
+	require.NoError(t, err)
+
+	before := time.Now()
+	require.NoError(t, s.AddJob("job1", schedule, nil))
+	after := time.Now()
+
+	readCreatedAt := func(t *testing.T) time.Time {
+		t.Helper()
+		jv, err := s.readJobValueFromKV(ctx, "job1")
+		require.NoError(t, err)
+		return jv.CreatedAt
+	}
+
+	initial := readCreatedAt(t)
+	require.False(t, initial.IsZero(), "AddJob must persist CreatedAt")
+	require.False(t, initial.Before(before.Add(-time.Second)) || initial.After(after.Add(time.Second)),
+		"CreatedAt %v not within [%v, %v]", initial, before, after)
+
+	// Wait through at least one execution so executeJob Step 1 runs.
+	select {
+	case <-fired:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler did not fire within 5s")
+	}
+	// Give Step 1 a beat to land in KV.
+	time.Sleep(200 * time.Millisecond)
+
+	afterFire := readCreatedAt(t)
+	assert.Equal(t, initial, afterFire,
+		"CreatedAt must be preserved across post-handler KV write")
+
+	// UpdateJobSchedule used to drop CreatedAt as well.
+	updatedSchedule, err := NewIntervalSchedule(time.Second)
+	require.NoError(t, err)
+	require.NoError(t, s.UpdateJobSchedule("job1", updatedSchedule))
+	afterUpdate := readCreatedAt(t)
+	assert.Equal(t, initial, afterUpdate,
+		"CreatedAt must be preserved across UpdateJobSchedule")
 }

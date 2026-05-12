@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -58,6 +59,18 @@ const (
 	// still be electing a leader — any publish/KV call issued in that
 	// window returns nats: no responders available for request.
 	defaultStartupStreamReadyTimeout = 30 * time.Second
+
+	// defaultReconcilerInterval is how often the background reconciler scans
+	// the job KV for chains whose next-tick publish was lost. Enabled by
+	// default so a single dropped publish does not silently kill a recurring
+	// job — the reconciler will republish within this interval.
+	defaultReconcilerInterval = 30 * time.Second
+
+	// defaultAddJobRetryBudget bounds how long AddJob / UpdateJobSchedule
+	// will keep retrying their KV write and publish through a transient
+	// cluster hiccup (typically a raft leader re-election finishes well
+	// inside this budget). Zero disables the retry.
+	defaultAddJobRetryBudget = 5 * time.Second
 )
 
 // ErrNATSServerTooOld indicates the connected NATS server does not support
@@ -133,27 +146,6 @@ func WithNATSSchedulerCodec(codec ScheduleCodec) NATSSchedulerOption {
 	}
 }
 
-// WithSkipStartupCleanup controls whether Start() purges the scheduled-message
-// stream and deletes the existing durable consumer.
-//
-// The default (false) preserves the original v0.0.5 behaviour and is safe for
-// single-instance deployments: stale messages from the previous run are
-// dropped and a fresh consumer is created.
-//
-// In multi-instance deployments where several processes share the same NATS
-// JetStream cluster (and therefore the same SCHEDULER stream / KV buckets /
-// durable consumer), the default is destructive: a peer's Start() wipes the
-// scheduled messages a healthy peer has already published, and deletes the
-// durable consumer the healthy peer is consuming from. Pass true to skip both
-// operations and rely on the per-message Nats-Msg-Id (combined with the
-// stream's Duplicates window) to suppress the duplicate publishes that
-// loadJobsFromKV would otherwise produce.
-func WithSkipStartupCleanup(skip bool) NATSSchedulerOption {
-	return func(s *natsSchedulerImpl) {
-		s.skipStartupCleanup = skip
-	}
-}
-
 // WithStreamDuplicatesWindow overrides the duration the stream tracks
 // Nats-Msg-Id values for deduplication. Larger values catch republishes that
 // arrive long after the original publish (e.g. a peer that restarts hours
@@ -201,20 +193,37 @@ func WithPublishRetry(attempts int, initialBackoff time.Duration) NATSSchedulerO
 	}
 }
 
-// WithReconcilerInterval enables a background goroutine that periodically
-// scans the job KV and republishes the scheduled message for any recurring
-// job whose NextRun is more than the supplied grace period in the past.
+// WithReconcilerInterval overrides how often the background reconciler scans
+// the job KV and republishes the scheduled message for any recurring job
+// whose NextRun is more than the supplied grace period in the past.
 //
 // Combined with the stream's Duplicates window and the deterministic
 // Nats-Msg-Id used by publishScheduledMessage, republishing is safe even
 // when the original scheduled message is still alive in the stream: the
 // duplicate is silently suppressed.
 //
-// interval <= 0 disables the reconciler (the default). A typical setting is
-// one full schedule interval (e.g. 1m for a minute-granularity cron).
+// The reconciler is enabled by default (defaultReconcilerInterval). Passing
+// interval <= 0 disables it.
 func WithReconcilerInterval(interval time.Duration) NATSSchedulerOption {
 	return func(s *natsSchedulerImpl) {
 		s.reconcilerInterval = interval
+	}
+}
+
+// WithAddJobRetryBudget bounds how long AddJob and UpdateJobSchedule will
+// keep retrying their KV write and scheduled-message publish through a
+// transient cluster hiccup (a raft leader re-election typically finishes
+// well inside the default 5 s budget). A truly unavailable cluster will
+// exhaust the budget and bubble the error back to the caller.
+//
+// Setting budget <= 0 disables the retry entirely, restoring the previous
+// "fail fast on the first transient error" behaviour.
+func WithAddJobRetryBudget(budget time.Duration) NATSSchedulerOption {
+	return func(s *natsSchedulerImpl) {
+		if budget < 0 {
+			budget = 0
+		}
+		s.addJobRetryBudget = budget
 	}
 }
 
@@ -277,8 +286,12 @@ type natsSchedulerImpl struct {
 	jobBucket     string
 	execBucket    string
 
-	skipStartupCleanup bool
-	duplicatesWindow   time.Duration
+	duplicatesWindow time.Duration
+
+	// addJobRetryBudget bounds how long AddJob / UpdateJobSchedule will
+	// keep retrying their KV write and publish through a transient cluster
+	// hiccup (typically a raft leader re-election). Zero disables retry.
+	addJobRetryBudget time.Duration
 
 	logger                    NATSSchedulerLogger
 	onRescheduleFailed        RescheduleFailureFunc
@@ -323,7 +336,9 @@ func NewNATSScheduler(js jetstream.JetStream, handler JobHandler, opts ...NATSSc
 		publishRetryBackoff:       defaultPublishRetryBackoff,
 		postHandlerTimeout:        defaultPostHandlerTimeout,
 		startupStreamReadyTimeout: defaultStartupStreamReadyTimeout,
+		reconcilerInterval:        defaultReconcilerInterval,
 		reconcilerGrace:           30 * time.Second,
+		addJobRetryBudget:         defaultAddJobRetryBudget,
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -399,15 +414,13 @@ func (s *natsSchedulerImpl) Start(ctx context.Context) error {
 		}
 	}
 
-	if !s.skipStartupCleanup {
-		// Single-instance behaviour: clear stale state from a previous run.
-		// Skipped when WithSkipStartupCleanup(true) is set so a starting peer
-		// does not wipe the scheduled messages a healthy peer just published
-		// and does not delete the durable consumer that healthy peer is
-		// consuming from.
-		_ = s.stream.Purge(ctx)
-		_ = s.stream.DeleteConsumer(ctx, s.consumerName)
-	}
+	// No startup purge or consumer delete. Stale messages left behind from a
+	// previous run are filtered by the KV validation in handleMessage (a msg
+	// whose ScheduledAt is <= KV.LastRun or < KV.NextRun is acked and
+	// dropped). This keeps single- and multi-instance deployments on a
+	// single code path: multi-instance must not wipe a healthy peer's
+	// already-published scheduled messages, and single-instance no longer
+	// needs to.
 
 	// Load persisted jobs and reschedule them
 	if err := s.loadJobsFromKV(ctx); err != nil {
@@ -514,12 +527,13 @@ func (s *natsSchedulerImpl) AddJob(id string, schedule Schedule, metadata map[st
 	}
 
 	job := &jobImpl{
-		id:       id,
-		schedule: schedule,
-		metadata: copyMetadata(metadata),
-		nextRun:  nextRun,
-		lastRun:  time.Time{},
-		running:  false,
+		id:        id,
+		schedule:  schedule,
+		metadata:  copyMetadata(metadata),
+		nextRun:   nextRun,
+		lastRun:   time.Time{},
+		createdAt: now,
+		running:   false,
 	}
 	s.jobs[id] = job
 
@@ -540,13 +554,36 @@ func (s *natsSchedulerImpl) AddJob(id string, schedule Schedule, metadata map[st
 			delete(s.jobs, id)
 			return err
 		}
-		if _, err = s.jobKV.Create(s.ctx, id, data); err != nil {
+
+		// KV.Create is a request-reply call. A transient cluster condition
+		// (raft leader flip, very brief partition) can fail either before
+		// the server processed the request — safe to retry — or after, in
+		// which case our retry observes ErrKeyExists for our own already-
+		// landed write. Get-and-compare disambiguates: matching value means
+		// our previous attempt's ack was the thing that got dropped.
+		createErr := s.doWithTransientRetry(s.ctx, s.addJobRetryBudget, func(ctx context.Context) error {
+			_, e := s.jobKV.Create(ctx, id, data)
+			if errors.Is(e, jetstream.ErrKeyExists) {
+				existing, getErr := s.jobKV.Get(ctx, id)
+				if getErr == nil && bytes.Equal(existing.Value(), data) {
+					return nil
+				}
+				return ErrJobAlreadyExists
+			}
+			return e
+		})
+		if createErr != nil {
 			delete(s.jobs, id)
-			return fmt.Errorf("failed to save job to KV: %w", err)
+			if errors.Is(createErr, ErrJobAlreadyExists) {
+				return ErrJobAlreadyExists
+			}
+			return fmt.Errorf("failed to save job to KV: %w", createErr)
 		}
 
 		// Publish scheduled message for the first execution
-		if err := s.publishScheduledMessage(s.ctx, id, nextRun); err != nil {
+		if err := s.doWithTransientRetry(s.ctx, s.addJobRetryBudget, func(ctx context.Context) error {
+			return s.publishScheduledMessage(ctx, id, nextRun)
+		}); err != nil {
 			_ = s.jobKV.Purge(s.ctx, id)
 			delete(s.jobs, id)
 			return fmt.Errorf("failed to publish scheduled message: %w", err)
@@ -609,6 +646,7 @@ func (s *natsSchedulerImpl) UpdateJobSchedule(id string, schedule Schedule) erro
 	job.nextRun = nextRun
 	metadata := copyMetadata(job.metadata)
 	lastRun := job.lastRun
+	createdAt := job.createdAt
 	job.mu.Unlock()
 	s.mu.Unlock()
 
@@ -621,6 +659,7 @@ func (s *natsSchedulerImpl) UpdateJobSchedule(id string, schedule Schedule) erro
 			Status:         string(JobStatusPending),
 			NextRun:        nextRun,
 			LastRun:        lastRun,
+			CreatedAt:      createdAt,
 			UpdatedAt:      now,
 			Metadata:       metadata,
 		}
@@ -632,7 +671,10 @@ func (s *natsSchedulerImpl) UpdateJobSchedule(id string, schedule Schedule) erro
 			job.mu.Unlock()
 			return err
 		}
-		if _, err = s.jobKV.Put(s.ctx, id, data); err != nil {
+		if err := s.doWithTransientRetry(s.ctx, s.addJobRetryBudget, func(ctx context.Context) error {
+			_, e := s.jobKV.Put(ctx, id, data)
+			return e
+		}); err != nil {
 			job.mu.Lock()
 			job.schedule = oldSchedule
 			job.nextRun = oldNextRun
@@ -640,10 +682,17 @@ func (s *natsSchedulerImpl) UpdateJobSchedule(id string, schedule Schedule) erro
 			return err
 		}
 
-		// Purge old scheduled messages and publish new one
+		// Purge old scheduled messages and publish new one. Purge is
+		// best-effort — even if it fails the per-message dedup window plus
+		// the KV validation in handleMessage will suppress the previous
+		// schedule's pending messages.
 		subject := s.jobSubject(id)
-		_ = s.stream.Purge(s.ctx, jetstream.WithPurgeSubject(subject))
-		if err := s.publishScheduledMessage(s.ctx, id, nextRun); err != nil {
+		_ = s.doWithTransientRetry(s.ctx, s.addJobRetryBudget, func(ctx context.Context) error {
+			return s.stream.Purge(ctx, jetstream.WithPurgeSubject(subject))
+		})
+		if err := s.doWithTransientRetry(s.ctx, s.addJobRetryBudget, func(ctx context.Context) error {
+			return s.publishScheduledMessage(ctx, id, nextRun)
+		}); err != nil {
 			return fmt.Errorf("failed to publish scheduled message: %w", err)
 		}
 	}
@@ -784,7 +833,6 @@ func (s *natsSchedulerImpl) handleMessage(msg jetstream.Msg) {
 		s.mu.Unlock()
 	}
 
-	// Skip already-executed one-time schedules
 	job.mu.RLock()
 	currentSchedule := job.schedule
 	lastRun := job.lastRun
@@ -794,20 +842,33 @@ func (s *natsSchedulerImpl) handleMessage(msg jetstream.Msg) {
 		return
 	}
 
-	// Skip messages whose scheduledAt is at or before the last execution.
-	// Covers two scenarios:
-	//   1. A peer was offline long enough for stale messages to accumulate
-	//      in the stream; on restart they would otherwise re-fire with past
-	//      scheduledAt values.
-	//   2. A duplicate publish that slipped past the Duplicates window (e.g.
-	//      a peer restart spread wider than WithStreamDuplicatesWindow).
-	// lastRun is a per-peer view and may lag the KV truth across pods, so
-	// this catches the common cases without claiming exactness — the
-	// authoritative cross-pod ordering still relies on JetStream's
-	// at-most-once delivery per durable consumer.
-	if !lastRun.IsZero() && !schedMsg.ScheduledAt.After(lastRun) {
-		_ = msg.Ack()
-		return
+	// KV is the cross-peer source of truth for schedule state. The in-memory
+	// job cache on this peer may lag the KV (e.g. peer B sees a redelivery
+	// for a job peer A finished and acked, or the stream still holds a stale
+	// message left over from a previous run on this same peer). Both cases
+	// look like "valid scheduled message" locally, so the only safe filter
+	// is reading the authoritative KV state for the (jobID, scheduledAt)
+	// being processed.
+	//
+	// Two conditions drop the message as superseded:
+	//   - ScheduledAt is at or before KV.LastRun — already-executed delivery
+	//     (typical after a peer crashed mid-handler and AckWait expired)
+	//   - ScheduledAt is before KV.NextRun — earlier-tick delivery that has
+	//     been recomputed past it (typical after restart where loadJobsFromKV
+	//     moved NextRun forward)
+	//
+	// KV-read failure is non-fatal: we fall through to handling the message
+	// normally. This preserves the previous behaviour during a brief KV-side
+	// outage rather than silently dropping every delivery.
+	if kvJV, kvErr := s.readJobValueFromKV(s.ctx, jobID); kvErr == nil {
+		if !kvJV.LastRun.IsZero() && !schedMsg.ScheduledAt.After(kvJV.LastRun) {
+			_ = msg.Ack()
+			return
+		}
+		if !kvJV.NextRun.IsZero() && schedMsg.ScheduledAt.Before(kvJV.NextRun) {
+			_ = msg.Ack()
+			return
+		}
 	}
 
 	// Guard: if the scheduled time has not arrived yet, NAK with delay.
@@ -887,11 +948,9 @@ func (s *natsSchedulerImpl) executeJob(job *jobImpl, scheduledAt time.Time) {
 	endTime := time.Now()
 	duration := endTime.Sub(startTime)
 
-	// Update job state. Note: job.running stays true until the post-handler
-	// section below finishes. waitForJobs() (called from Stop) only checks
-	// job.IsRunning(), so resetting running here would let Stop return —
-	// and the caller may then close the NATS connection — before the
-	// next-tick publish completes, breaking the recurring chain.
+	// Update in-memory job state. job.running stays true until the entire
+	// post-handler section below finishes — see comment on the final
+	// job.running = false below for why that matters for Stop().
 	job.mu.Lock()
 	job.lastRun = startTime
 	nextRun := job.schedule.Next(endTime)
@@ -905,14 +964,41 @@ func (s *natsSchedulerImpl) executeJob(job *jobImpl, scheduledAt time.Time) {
 		errorMsg = handlerErr.Error()
 	}
 
-	// Post-handler updates and the next-tick publish must outlive Stop()'s
-	// context cancellation. If we used s.ctx here, a SIGTERM mid-tick would
-	// silently fail to enqueue the next scheduled message and break the
-	// recurring chain until a peer restart triggers loadJobsFromKV.
+	// Post-handler work must outlive Stop()'s context cancellation. If we
+	// used s.ctx here, a SIGTERM mid-tick would silently fail to enqueue
+	// the next scheduled message and break the recurring chain until the
+	// reconciler picks it up on the next sweep.
 	postCtx, postCancel := context.WithTimeout(context.Background(), s.postHandlerTimeout)
 	defer postCancel()
 
-	// Save execution record to KV (best-effort)
+	// Step 1: Persist the authoritative post-handler KV state IMMEDIATELY.
+	// LastRun is set to the message's scheduledAt (not startTime) so that
+	// any redelivery of this same (jobID, scheduledAt) — most commonly
+	// after a peer crash and AckWait expiry — is identifiable by the next
+	// handler invocation as already-executed and dropped by handleMessage's
+	// KV validation. This compresses the "handler done but LastRun not yet
+	// persisted" window to a single KV.Put RTT.
+	if s.jobKV != nil {
+		scheduleType, scheduleConfig, _ := s.codec.Encode(currentSchedule)
+		jv := &natsJobValue{
+			ID:             job.id,
+			ScheduleType:   scheduleType,
+			ScheduleConfig: scheduleConfig,
+			Status:         string(status),
+			NextRun:        nextRun,
+			LastRun:        scheduledAt,
+			CreatedAt:      job.createdAt,
+			UpdatedAt:      endTime,
+			Metadata:       copyMetadata(metadata),
+		}
+		data, _ := json.Marshal(jv)
+		if _, err := s.jobKV.Put(postCtx, job.id, data); err != nil {
+			s.logError("failed to persist job state",
+				"job_id", job.id, "next_run", nextRun, "err", err)
+		}
+	}
+
+	// Step 2: Save execution record to KV (best-effort).
 	if s.execKV != nil {
 		record := &natsExecValue{
 			JobID:       job.id,
@@ -931,9 +1017,9 @@ func (s *natsSchedulerImpl) executeJob(job *jobImpl, scheduledAt time.Time) {
 		}
 	}
 
-	// Schedule next execution (skip for one-time schedules) before the
-	// final KV state write so the persisted Status accurately reflects
-	// whether the next-tick publish succeeded.
+	// Step 3: Publish the next-tick scheduled message (recurring schedules
+	// only). If this fails the reconciler will republish on its next sweep,
+	// so a transient publish failure no longer kills the chain silently.
 	publishErr := error(nil)
 	if _, ok := currentSchedule.(*OnceSchedule); !ok {
 		publishErr = s.publishScheduledMessageWithRetry(postCtx, job.id, nextRun)
@@ -946,36 +1032,37 @@ func (s *natsSchedulerImpl) executeJob(job *jobImpl, scheduledAt time.Time) {
 		}
 	}
 
-	// Update job state in KV (best-effort)
-	if s.jobKV != nil {
-		// JobStatusReschedulingFailed is reserved for the "handler succeeded
-		// but we couldn't enqueue the next tick" case; when the handler
-		// itself failed, the handler error remains the primary signal.
-		finalStatus := status
-		if publishErr != nil && handlerErr == nil {
-			finalStatus = JobStatusReschedulingFailed
-		}
+	// Step 4: If the publish failed despite a successful handler, rewrite
+	// the KV row so the persisted Status reflects "handler succeeded but
+	// next-tick publish never landed". JobStatusReschedulingFailed is the
+	// observability hook for reconciler dashboards / dead-letter handling.
+	// When the handler itself failed, the handler error stays the primary
+	// signal — we don't overwrite it with a reschedule status.
+	if s.jobKV != nil && publishErr != nil && handlerErr == nil {
 		scheduleType, scheduleConfig, _ := s.codec.Encode(currentSchedule)
 		jv := &natsJobValue{
 			ID:             job.id,
 			ScheduleType:   scheduleType,
 			ScheduleConfig: scheduleConfig,
-			Status:         string(finalStatus),
+			Status:         string(JobStatusReschedulingFailed),
 			NextRun:        nextRun,
-			LastRun:        startTime,
-			UpdatedAt:      endTime,
+			LastRun:        scheduledAt,
+			CreatedAt:      job.createdAt,
+			UpdatedAt:      time.Now(),
 			Metadata:       copyMetadata(metadata),
 		}
 		data, _ := json.Marshal(jv)
 		if _, err := s.jobKV.Put(postCtx, job.id, data); err != nil {
-			s.logError("failed to persist job state",
+			s.logError("failed to persist rescheduling-failed status",
 				"job_id", job.id, "next_run", nextRun, "err", err)
 		}
 	}
 
 	// Mark the job as no longer running only after all post-handler work is
-	// done. This is what makes waitForJobs() (and therefore Stop()) wait for
-	// the next-tick publish to complete.
+	// done. waitForJobs() (called from Stop) only checks job.IsRunning(),
+	// so resetting running earlier would let Stop return — and the caller
+	// may then close the NATS connection — before the next-tick publish
+	// completes.
 	job.mu.Lock()
 	job.running = false
 	job.mu.Unlock()
@@ -1189,6 +1276,63 @@ func (s *natsSchedulerImpl) logError(msg string, keysAndValues ...any) {
 	s.logger(msg, keysAndValues...)
 }
 
+// doWithTransientRetry runs op until it succeeds, the budget elapses, or
+// ctx is cancelled. Backoff doubles each attempt (100ms, 200ms, 400ms, 800ms)
+// and is capped at 1s. All errors are retried; the caller is responsible for
+// choosing a budget that matches "transient hiccup" rather than "real failure"
+// (the default 5 s comfortably covers a JetStream raft re-election).
+//
+// budget <= 0 falls through to a single attempt — same behaviour as before
+// the retry helper existed.
+func (s *natsSchedulerImpl) doWithTransientRetry(ctx context.Context, budget time.Duration, op func(context.Context) error) error {
+	if budget <= 0 {
+		return op(ctx)
+	}
+	deadline := time.Now().Add(budget)
+	backoff := 100 * time.Millisecond
+	var lastErr error
+	for {
+		if err := ctx.Err(); err != nil {
+			if lastErr != nil {
+				return lastErr
+			}
+			return err
+		}
+		// Cap each attempt so a hung call cannot blow past the overall budget.
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			if lastErr != nil {
+				return lastErr
+			}
+			return context.DeadlineExceeded
+		}
+		callCtx, cancel := context.WithTimeout(ctx, remaining)
+		err := op(callCtx)
+		cancel()
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+
+		// Don't bother sleeping if there's no time left for another attempt.
+		if time.Until(deadline) <= 0 {
+			return lastErr
+		}
+
+		select {
+		case <-ctx.Done():
+			return lastErr
+		case <-time.After(backoff):
+		}
+		if backoff < time.Second {
+			backoff *= 2
+			if backoff > time.Second {
+				backoff = time.Second
+			}
+		}
+	}
+}
+
 // publishScheduledMessageWithRetry retries publishScheduledMessage with
 // bounded exponential backoff. The first attempt counts toward the budget,
 // so attempts = 3 means 1 initial + 2 retries.
@@ -1263,6 +1407,24 @@ func (s *natsSchedulerImpl) jobSubject(jobID string) string {
 	return s.subjectPrefix + ".jobs." + jobID
 }
 
+// readJobValueFromKV fetches and JSON-decodes the natsJobValue for a job id.
+// Used by handleMessage to validate scheduledAt against the authoritative KV
+// LastRun/NextRun without paying for schedule decoding.
+func (s *natsSchedulerImpl) readJobValueFromKV(ctx context.Context, id string) (*natsJobValue, error) {
+	if s.jobKV == nil {
+		return nil, ErrJobNotFound
+	}
+	entry, err := s.jobKV.Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	var jv natsJobValue
+	if err := json.Unmarshal(entry.Value(), &jv); err != nil {
+		return nil, err
+	}
+	return &jv, nil
+}
+
 // loadJobFromKV reads a single job entry from the KV bucket and rebuilds an
 // in-memory jobImpl from it. Used by handleMessage to recover a job that this
 // peer has not seen because another peer added it after our Start().
@@ -1283,11 +1445,12 @@ func (s *natsSchedulerImpl) loadJobFromKV(ctx context.Context, id string) (*jobI
 		return nil, err
 	}
 	return &jobImpl{
-		id:       jv.ID,
-		schedule: schedule,
-		metadata: copyMetadata(jv.Metadata),
-		nextRun:  jv.NextRun,
-		lastRun:  jv.LastRun,
+		id:        jv.ID,
+		schedule:  schedule,
+		metadata:  copyMetadata(jv.Metadata),
+		nextRun:   jv.NextRun,
+		lastRun:   jv.LastRun,
+		createdAt: jv.CreatedAt,
 	}, nil
 }
 
@@ -1330,29 +1493,61 @@ func (s *natsSchedulerImpl) loadJobsFromKV(ctx context.Context) error {
 			if !onceSchedule.RunAt().After(now) {
 				// Still load into memory for GetJob/ListJobs but don't schedule
 				s.jobs[jv.ID] = &jobImpl{
-					id:       jv.ID,
-					schedule: schedule,
-					metadata: copyMetadata(jv.Metadata),
-					nextRun:  onceSchedule.RunAt(),
-					lastRun:  jv.LastRun,
+					id:        jv.ID,
+					schedule:  schedule,
+					metadata:  copyMetadata(jv.Metadata),
+					nextRun:   onceSchedule.RunAt(),
+					lastRun:   jv.LastRun,
+					createdAt: jv.CreatedAt,
 				}
 				continue
 			}
 		}
 
 		nextRun := jv.NextRun
+		recomputed := false
 		if nextRun.Before(now) {
 			nextRun = schedule.Next(now)
+			recomputed = true
 		}
 
 		job := &jobImpl{
-			id:       jv.ID,
-			schedule: schedule,
-			metadata: copyMetadata(jv.Metadata),
-			nextRun:  nextRun,
-			lastRun:  jv.LastRun,
+			id:        jv.ID,
+			schedule:  schedule,
+			metadata:  copyMetadata(jv.Metadata),
+			nextRun:   nextRun,
+			lastRun:   jv.LastRun,
+			createdAt: jv.CreatedAt,
 		}
 		s.jobs[jv.ID] = job
+
+		// Persist the recomputed NextRun back to KV so handleMessage's
+		// KV-based stale-msg check (scheduledAt < KV.NextRun) can reject
+		// any stream-resident message left over from the previous run.
+		//
+		// CAS-guarded with the revision we read above: if another peer (or
+		// this peer's own handler completing concurrently) wrote a fresher
+		// value between our Get and Update, the Update returns ErrKeyExists
+		// (same JSErrCodeStreamWrongLastSequence wrapper Create uses) and
+		// we skip silently — the racer already established a NextRun at
+		// least as recent as ours, which is exactly what the stale-msg
+		// guard needs. Falling back to Put would clobber LastRun/Status
+		// written by the racer.
+		if recomputed {
+			jv.NextRun = nextRun
+			jv.UpdatedAt = now
+			if data, mErr := json.Marshal(&jv); mErr == nil {
+				if _, pErr := s.jobKV.Update(ctx, jv.ID, data, entry.Revision()); pErr != nil {
+					if !errors.Is(pErr, jetstream.ErrKeyExists) {
+						s.logError("startup: failed to persist recomputed next-run to KV",
+							"job_id", jv.ID, "next_run", nextRun, "err", pErr)
+					}
+				}
+			} else {
+				s.logError("startup: failed to marshal recomputed job value",
+					"job_id", jv.ID, "err", mErr)
+			}
+		}
 
 		if err := s.publishScheduledMessage(ctx, jv.ID, nextRun); err != nil {
 			s.logError("startup: failed to publish scheduled message",

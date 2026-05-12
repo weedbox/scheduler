@@ -153,12 +153,13 @@ func (s *schedulerImpl) AddJob(id string, schedule Schedule, metadata map[string
 		}
 	}
 	job := &jobImpl{
-		id:       id,
-		schedule: schedule,
-		metadata: copyMetadata(metadata),
-		nextRun:  nextRun,
-		lastRun:  time.Time{},
-		running:  false,
+		id:        id,
+		schedule:  schedule,
+		metadata:  copyMetadata(metadata),
+		nextRun:   nextRun,
+		lastRun:   time.Time{},
+		createdAt: now,
+		running:   false,
 	}
 
 	s.jobs[id] = job
@@ -535,12 +536,13 @@ func (s *schedulerImpl) loadJobsFromStorage(ctx context.Context) error {
 			}
 
 			job := &jobImpl{
-				id:       jobData.ID,
-				schedule: schedule,
-				metadata: copyMetadata(jobData.Metadata),
-				nextRun:  nextRun,
-				lastRun:  jobData.LastRun,
-				running:  false,
+				id:        jobData.ID,
+				schedule:  schedule,
+				metadata:  copyMetadata(jobData.Metadata),
+				nextRun:   nextRun,
+				lastRun:   jobData.LastRun,
+				createdAt: jobData.CreatedAt,
+				running:   false,
 			}
 
 			s.jobs[jobData.ID] = job
@@ -573,13 +575,14 @@ func (s *schedulerImpl) waitForJobs() {
 
 // jobImpl is the concrete implementation of the Job interface
 type jobImpl struct {
-	mu       sync.RWMutex
-	id       string
-	schedule Schedule
-	metadata map[string]string
-	nextRun  time.Time
-	lastRun  time.Time
-	running  bool
+	mu        sync.RWMutex
+	id        string
+	schedule  Schedule
+	metadata  map[string]string
+	nextRun   time.Time
+	lastRun   time.Time
+	createdAt time.Time
+	running   bool
 }
 
 // ID returns the unique identifier of the job
