@@ -71,6 +71,32 @@ const (
 	// cluster hiccup (typically a raft leader re-election finishes well
 	// inside this budget). Zero disables the retry.
 	defaultAddJobRetryBudget = 5 * time.Second
+
+	// defaultStartPhaseTimeout caps each individual NATS API call inside
+	// Start() (KV bucket creation, stream creation, consumer creation,
+	// initial Consume subscribe). Without this, a single hung JetStream
+	// API request would consume the caller's entire Start ctx — typical
+	// callers pass several minutes, so the failure surfaced 5+ minutes
+	// after the real problem with no indication of which phase blocked.
+	// Each phase logs entry/exit timing through the installed logger and
+	// its error is wrapped with the phase name. Zero falls back to using
+	// the caller's ctx directly (legacy behaviour).
+	defaultStartPhaseTimeout = 30 * time.Second
+
+	// defaultJetStreamReadyTimeout bounds how long Start() waits for the
+	// JetStream metaleader to be available before issuing any JetStream API
+	// call. Brand-new multi-node deployments race scheduler startup against
+	// the cluster's metaleader raft election: until a metaleader is elected
+	// the JetStream API does not reliably return NoResponders, so the very
+	// first AccountInfo / CreateOrUpdateKeyValue call hangs for the caller's
+	// entire ctx deadline (nats.go documents this on AccountInfo: "For
+	// clustered topologies, AccountInfo will time out").
+	//
+	// The wait probes AccountInfo with a 2 s per-call cap and short
+	// exponential backoff; on a healthy cluster it returns almost
+	// instantly, on a still-electing cluster it returns the moment the
+	// metaleader is up.
+	defaultJetStreamReadyTimeout = 30 * time.Second
 )
 
 // ErrNATSServerTooOld indicates the connected NATS server does not support
@@ -248,6 +274,50 @@ func WithStartupStreamReadyTimeout(timeout time.Duration) NATSSchedulerOption {
 	}
 }
 
+// WithJetStreamReadyTimeout bounds how long Start() waits for the
+// JetStream metaleader to be reachable before issuing the first KV /
+// stream / consumer create.
+//
+// This is the fix for the multi-instance brand-new-deployment hang.
+// nats.go's AccountInfo documents:
+//
+//	"For clustered topologies, AccountInfo will time out."
+//
+// Every JetStream API the scheduler uses (CreateOrUpdateKeyValue,
+// CreateOrUpdateStream, CreateOrUpdateConsumer) issues an AccountInfo
+// internally. When several scheduler instances boot against a freshly-
+// started 3-node NATS cluster, the metaleader may still be electing —
+// the API request neither succeeds nor fails fast, it hangs for the
+// caller's ctx deadline. Without this wait, Start() can hang for
+// minutes (typical caller ctx is much longer than 30 s).
+//
+// timeout <= 0 disables the wait (legacy behaviour). Default 30 s
+// comfortably covers a metaleader election; the moment the metaleader
+// answers, the wait returns.
+func WithJetStreamReadyTimeout(timeout time.Duration) NATSSchedulerOption {
+	return func(s *natsSchedulerImpl) {
+		s.jetStreamReadyTimeout = timeout
+	}
+}
+
+// WithStartPhaseTimeout caps each individual NATS API call inside Start
+// (KV bucket creation, stream creation, backing-stream wait, persisted-job
+// load, consumer creation, initial Consume subscribe). Without this cap a
+// single hung JetStream API request consumes the caller's entire Start
+// context — typical callers pass several minutes, so the hang surfaces 5+
+// minutes later with no indication of which phase blocked.
+//
+// Each phase logs entry, exit, and elapsed time through the installed
+// logger, and on failure the returned error is wrapped with the phase name.
+//
+// timeout <= 0 falls back to using the caller's ctx directly (legacy
+// behaviour, no per-phase bound).
+func WithStartPhaseTimeout(timeout time.Duration) NATSSchedulerOption {
+	return func(s *natsSchedulerImpl) {
+		s.startPhaseTimeout = timeout
+	}
+}
+
 // WithReconcilerGracePeriod sets the lag tolerance the reconciler applies
 // before treating a job as stuck. A job is republished only if its KV
 // NextRun is older than now - gracePeriod. The default is 30 s, large enough
@@ -298,7 +368,9 @@ type natsSchedulerImpl struct {
 	publishAttempts           int
 	publishRetryBackoff       time.Duration
 	postHandlerTimeout        time.Duration
+	jetStreamReadyTimeout     time.Duration
 	startupStreamReadyTimeout time.Duration
+	startPhaseTimeout         time.Duration
 
 	reconcilerInterval time.Duration
 	reconcilerGrace    time.Duration
@@ -335,7 +407,9 @@ func NewNATSScheduler(js jetstream.JetStream, handler JobHandler, opts ...NATSSc
 		publishAttempts:           defaultPublishAttempts,
 		publishRetryBackoff:       defaultPublishRetryBackoff,
 		postHandlerTimeout:        defaultPostHandlerTimeout,
+		jetStreamReadyTimeout:     defaultJetStreamReadyTimeout,
 		startupStreamReadyTimeout: defaultStartupStreamReadyTimeout,
+		startPhaseTimeout:         defaultStartPhaseTimeout,
 		reconcilerInterval:        defaultReconcilerInterval,
 		reconcilerGrace:           30 * time.Second,
 		addJobRetryBudget:         defaultAddJobRetryBudget,
@@ -364,20 +438,46 @@ func (s *natsSchedulerImpl) Start(ctx context.Context) error {
 		return err
 	}
 
-	var err error
+	// Wait for the JetStream metaleader before any JS API call. In a
+	// freshly-started multi-node cluster the metaleader raft is still
+	// electing; nats.go's AccountInfo (which every CreateOrUpdate* path
+	// calls internally) does not return NoResponders in that window — it
+	// just hangs until the caller's ctx deadline. Without this gate, a
+	// brand-new 3-node deployment can leave some instances stuck for the
+	// full Start ctx (typically minutes) while others succeed by luck of
+	// timing.
+	if s.jetStreamReadyTimeout > 0 {
+		if err := s.startPhaseUnbounded(ctx, "wait-jetstream-ready", func(c context.Context) error {
+			return s.waitForJetStreamReady(c, s.jetStreamReadyTimeout)
+		}); err != nil {
+			return err
+		}
+	}
 
 	// Create KV buckets for job metadata and execution records
-	s.jobKV, err = s.js.CreateOrUpdateKeyValue(ctx, jetstream.KeyValueConfig{
-		Bucket: s.jobBucket,
-	})
-	if err != nil {
+	if err := s.startPhase(ctx, "create-job-kv", func(c context.Context) error {
+		kv, e := s.js.CreateOrUpdateKeyValue(c, jetstream.KeyValueConfig{
+			Bucket: s.jobBucket,
+		})
+		if e != nil {
+			return e
+		}
+		s.jobKV = kv
+		return nil
+	}); err != nil {
 		return fmt.Errorf("failed to create job KV bucket: %w", err)
 	}
 
-	s.execKV, err = s.js.CreateOrUpdateKeyValue(ctx, jetstream.KeyValueConfig{
-		Bucket: s.execBucket,
-	})
-	if err != nil {
+	if err := s.startPhase(ctx, "create-exec-kv", func(c context.Context) error {
+		kv, e := s.js.CreateOrUpdateKeyValue(c, jetstream.KeyValueConfig{
+			Bucket: s.execBucket,
+		})
+		if e != nil {
+			return e
+		}
+		s.execKV = kv
+		return nil
+	}); err != nil {
 		return fmt.Errorf("failed to create exec KV bucket: %w", err)
 	}
 
@@ -385,14 +485,20 @@ func (s *natsSchedulerImpl) Start(ctx context.Context) error {
 	// pairs with the per-message Nats-Msg-Id set by publishScheduledMessage
 	// to suppress duplicate publishes — most importantly the ones produced
 	// when several peers each run loadJobsFromKV at startup.
-	s.stream, err = s.js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
-		Name:              s.streamName,
-		Subjects:          []string{s.subjectPrefix + ".>"},
-		AllowMsgSchedules: true,
-		Retention:         jetstream.WorkQueuePolicy,
-		Duplicates:        s.duplicatesWindow,
-	})
-	if err != nil {
+	if err := s.startPhase(ctx, "create-stream", func(c context.Context) error {
+		st, e := s.js.CreateOrUpdateStream(c, jetstream.StreamConfig{
+			Name:              s.streamName,
+			Subjects:          []string{s.subjectPrefix + ".>"},
+			AllowMsgSchedules: true,
+			Retention:         jetstream.WorkQueuePolicy,
+			Duplicates:        s.duplicatesWindow,
+		})
+		if e != nil {
+			return e
+		}
+		s.stream = st
+		return nil
+	}); err != nil {
 		return fmt.Errorf("failed to create stream: %w", err)
 	}
 
@@ -409,7 +515,9 @@ func (s *natsSchedulerImpl) Start(ctx context.Context) error {
 	// election window — silently dropping the first startup publish for
 	// every persisted job until a peer restart.
 	if s.startupStreamReadyTimeout > 0 {
-		if err := s.waitForBackingStreams(ctx, s.startupStreamReadyTimeout); err != nil {
+		if err := s.startPhaseUnbounded(ctx, "wait-backing-streams", func(c context.Context) error {
+			return s.waitForBackingStreams(c, s.startupStreamReadyTimeout)
+		}); err != nil {
 			return fmt.Errorf("backing streams not ready: %w", err)
 		}
 	}
@@ -423,26 +531,44 @@ func (s *natsSchedulerImpl) Start(ctx context.Context) error {
 	// needs to.
 
 	// Load persisted jobs and reschedule them
-	if err := s.loadJobsFromKV(ctx); err != nil {
+	if err := s.startPhase(ctx, "load-jobs-from-kv", func(c context.Context) error {
+		return s.loadJobsFromKV(c)
+	}); err != nil {
 		return fmt.Errorf("failed to load jobs: %w", err)
 	}
 
 	// Create fresh consumer for receiving scheduled messages
-	consumer, err := s.stream.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
-		Durable:   s.consumerName,
-		AckPolicy: jetstream.AckExplicitPolicy,
-		AckWait:   5 * time.Minute,
-	})
-	if err != nil {
+	var consumer jetstream.Consumer
+	if err := s.startPhase(ctx, "create-consumer", func(c context.Context) error {
+		cons, e := s.stream.CreateOrUpdateConsumer(c, jetstream.ConsumerConfig{
+			Durable:   s.consumerName,
+			AckPolicy: jetstream.AckExplicitPolicy,
+			AckWait:   5 * time.Minute,
+		})
+		if e != nil {
+			return e
+		}
+		consumer = cons
+		return nil
+	}); err != nil {
 		return fmt.Errorf("failed to create consumer: %w", err)
 	}
 
 	s.ctx, s.cancel = context.WithCancel(ctx)
 	s.running = true
 
-	// Start consuming scheduled messages
-	s.consumeCtx, err = consumer.Consume(s.handleMessage)
-	if err != nil {
+	// Start consuming scheduled messages. Consume() itself is non-blocking
+	// in nats.go/jetstream — it sets up the pull subscription via a
+	// fire-and-forget PublishRequest — so we wrap it for the diagnostic
+	// log only, not because we expect it to hang.
+	if err := s.startPhase(ctx, "start-consume", func(c context.Context) error {
+		cc, e := consumer.Consume(s.handleMessage)
+		if e != nil {
+			return e
+		}
+		s.consumeCtx = cc
+		return nil
+	}); err != nil {
 		s.running = false
 		return fmt.Errorf("failed to start consuming: %w", err)
 	}
@@ -1274,6 +1400,122 @@ func (s *natsSchedulerImpl) logError(msg string, keysAndValues ...any) {
 		_ = recover()
 	}()
 	s.logger(msg, keysAndValues...)
+}
+
+// waitForJetStreamReady probes the JetStream metaleader with bounded
+// AccountInfo requests until one succeeds, the overall timeout elapses, or
+// ctx is cancelled.
+//
+// This is the fix for the multi-instance brand-new-deployment hang. nats.go
+// documents on AccountInfo: "For clustered topologies, AccountInfo will
+// time out." Every JetStream API used by Start (CreateOrUpdateKeyValue,
+// CreateOrUpdateStream, CreateOrUpdateConsumer) calls AccountInfo
+// internally — so until the metaleader is elected, the very first KV/stream
+// create hangs for the caller's whole ctx deadline (commonly minutes).
+//
+// Each probe is capped at 2 s so a server that swallows the request without
+// reply cannot consume the overall budget. Backoff doubles 100 ms → 500 ms.
+// ErrJetStreamNotEnabled and ErrJetStreamNotEnabledForAccount are terminal
+// (the cluster will not become ready by retrying) and returned immediately.
+func (s *natsSchedulerImpl) waitForJetStreamReady(ctx context.Context, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	backoff := 100 * time.Millisecond
+	var lastErr error
+	for {
+		if err := ctx.Err(); err != nil {
+			if lastErr != nil {
+				return fmt.Errorf("jetstream not ready: %w (last probe: %v)", err, lastErr)
+			}
+			return err
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			if lastErr != nil {
+				return fmt.Errorf("jetstream metaleader not ready after %s: %w", timeout, lastErr)
+			}
+			return fmt.Errorf("jetstream metaleader not ready after %s", timeout)
+		}
+		callTimeout := 2 * time.Second
+		if callTimeout > remaining {
+			callTimeout = remaining
+		}
+		callCtx, cancel := context.WithTimeout(ctx, callTimeout)
+		_, err := s.js.AccountInfo(callCtx)
+		cancel()
+		if err == nil {
+			return nil
+		}
+		if errors.Is(err, jetstream.ErrJetStreamNotEnabled) ||
+			errors.Is(err, jetstream.ErrJetStreamNotEnabledForAccount) {
+			return err
+		}
+		lastErr = err
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("jetstream not ready: %w (last probe: %v)", ctx.Err(), lastErr)
+		case <-time.After(backoff):
+		}
+		if backoff < 500*time.Millisecond {
+			backoff *= 2
+		}
+	}
+}
+
+// startPhase runs a single Start-time NATS API call under a bounded
+// sub-context (s.startPhaseTimeout), logging entry and exit through
+// s.logger. The wrapped op receives a context whose deadline is the sooner
+// of ctx and now + s.startPhaseTimeout. On failure the returned error is
+// prefixed with the phase name so the caller can identify which API call
+// blocked.
+//
+// When s.startPhaseTimeout <= 0 the helper uses ctx directly — legacy
+// behaviour with no per-phase bound. The phase entry/exit logs still fire,
+// which is useful for diagnosing multi-instance startup hangs.
+//
+// Use this for unbounded NATS API calls (CreateOrUpdate*, Consume).
+// For phases that already manage their own timeout (waitForJetStreamReady,
+// waitForBackingStreams) use startPhaseUnbounded so the outer cap doesn't
+// silently override the user-tunable inner budget.
+func (s *natsSchedulerImpl) startPhase(ctx context.Context, name string, op func(context.Context) error) error {
+	s.logError("start: phase begin", "phase", name)
+	start := time.Now()
+
+	var callCtx context.Context
+	var cancel context.CancelFunc
+	if s.startPhaseTimeout > 0 {
+		callCtx, cancel = context.WithTimeout(ctx, s.startPhaseTimeout)
+	} else {
+		callCtx, cancel = ctx, func() {}
+	}
+	defer cancel()
+
+	err := op(callCtx)
+	elapsed := time.Since(start)
+	if err != nil {
+		s.logError("start: phase failed", "phase", name, "elapsed", elapsed, "err", err)
+		return fmt.Errorf("%s: %w", name, err)
+	}
+	s.logError("start: phase ok", "phase", name, "elapsed", elapsed)
+	return nil
+}
+
+// startPhaseUnbounded is the variant of startPhase for phases that manage
+// their own timeout internally (waitForJetStreamReady,
+// waitForBackingStreams). It logs entry, exit, and elapsed time but does
+// NOT wrap ctx with s.startPhaseTimeout — that would silently truncate the
+// user-tunable inner budget when the two limits differ.
+func (s *natsSchedulerImpl) startPhaseUnbounded(ctx context.Context, name string, op func(context.Context) error) error {
+	s.logError("start: phase begin", "phase", name)
+	start := time.Now()
+	err := op(ctx)
+	elapsed := time.Since(start)
+	if err != nil {
+		s.logError("start: phase failed", "phase", name, "elapsed", elapsed, "err", err)
+		return fmt.Errorf("%s: %w", name, err)
+	}
+	s.logError("start: phase ok", "phase", name, "elapsed", elapsed)
+	return nil
 }
 
 // doWithTransientRetry runs op until it succeeds, the budget elapses, or
