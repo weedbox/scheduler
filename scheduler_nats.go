@@ -375,6 +375,15 @@ type natsSchedulerImpl struct {
 	reconcilerInterval time.Duration
 	reconcilerGrace    time.Duration
 	reconcilerWG       sync.WaitGroup
+
+	// once serializes the multi-process first-deploy race on
+	// CreateOrUpdateKeyValue / CreateOrUpdateStream /
+	// CreateOrUpdateConsumer inside Start. Defaults to a built-in
+	// JetStream-KV-backed implementation; WithOnce overrides for callers
+	// that already operate a distributed-lock service.
+	once           OnceFunc
+	onceLockBucket string
+	onceKey        string
 }
 
 // NewNATSScheduler creates a new Scheduler backed by NATS JetStream.
@@ -413,6 +422,8 @@ func NewNATSScheduler(js jetstream.JetStream, handler JobHandler, opts ...NATSSc
 		reconcilerInterval:        defaultReconcilerInterval,
 		reconcilerGrace:           30 * time.Second,
 		addJobRetryBudget:         defaultAddJobRetryBudget,
+		onceLockBucket:            defaultOnceLockBucket,
+		onceKey:                   defaultSchedulerOnceKey,
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -448,59 +459,79 @@ func (s *natsSchedulerImpl) Start(ctx context.Context) error {
 	// timing.
 	if s.jetStreamReadyTimeout > 0 {
 		if err := s.startPhaseUnbounded(ctx, "wait-jetstream-ready", func(c context.Context) error {
-			return s.waitForJetStreamReady(c, s.jetStreamReadyTimeout)
+			return waitForJetStreamReady(c, s.js, s.jetStreamReadyTimeout)
 		}); err != nil {
 			return err
 		}
 	}
 
-	// Create KV buckets for job metadata and execution records
-	if err := s.startPhase(ctx, "create-job-kv", func(c context.Context) error {
-		kv, e := s.js.CreateOrUpdateKeyValue(c, jetstream.KeyValueConfig{
-			Bucket: s.jobBucket,
-		})
-		if e != nil {
-			return e
-		}
-		s.jobKV = kv
-		return nil
-	}); err != nil {
-		return fmt.Errorf("failed to create job KV bucket: %w", err)
+	// Resolve the Once primitive used to serialize first-deploy
+	// CreateOrUpdate* races. WithOnce wins if the caller installed one;
+	// otherwise build the JetStream-KV-backed default lazily here so the
+	// allocation is paid only by callers that actually Start the
+	// scheduler.
+	if s.once == nil {
+		s.once = newOnceStore(s.js, s.onceLockBucket).Do
 	}
 
-	if err := s.startPhase(ctx, "create-exec-kv", func(c context.Context) error {
-		kv, e := s.js.CreateOrUpdateKeyValue(c, jetstream.KeyValueConfig{
-			Bucket: s.execBucket,
+	// Single Once block keyed "scheduler.init" wraps every first-deploy
+	// CreateOrUpdate*. Concurrent peers serialize through it; the
+	// sentinel fast-paths every subsequent boot. Lookups run outside —
+	// they're plain metadata reads that cannot hang on the reply-path
+	// race, and keeping them separate preserves per-step error context.
+	if err := s.startPhase(ctx, "provision", func(c context.Context) error {
+		return s.once(c, s.onceKey, func(c context.Context) error {
+			if _, e := s.js.CreateOrUpdateKeyValue(c, jetstream.KeyValueConfig{
+				Bucket: s.jobBucket,
+			}); e != nil {
+				return fmt.Errorf("create job KV: %w", e)
+			}
+			if _, e := s.js.CreateOrUpdateKeyValue(c, jetstream.KeyValueConfig{
+				Bucket: s.execBucket,
+			}); e != nil {
+				return fmt.Errorf("create exec KV: %w", e)
+			}
+			if _, e := s.js.CreateOrUpdateStream(c, jetstream.StreamConfig{
+				Name:              s.streamName,
+				Subjects:          []string{s.subjectPrefix + ".>"},
+				AllowMsgSchedules: true,
+				Retention:         jetstream.WorkQueuePolicy,
+				Duplicates:        s.duplicatesWindow,
+			}); e != nil {
+				return fmt.Errorf("create stream: %w", e)
+			}
+			st, e := s.js.Stream(c, s.streamName)
+			if e != nil {
+				return fmt.Errorf("lookup stream for consumer create: %w", e)
+			}
+			if _, e := st.CreateOrUpdateConsumer(c, jetstream.ConsumerConfig{
+				Durable:   s.consumerName,
+				AckPolicy: jetstream.AckExplicitPolicy,
+				AckWait:   5 * time.Minute,
+			}); e != nil {
+				return fmt.Errorf("create consumer: %w", e)
+			}
+			return nil
 		})
-		if e != nil {
-			return e
-		}
-		s.execKV = kv
-		return nil
 	}); err != nil {
-		return fmt.Errorf("failed to create exec KV bucket: %w", err)
+		return fmt.Errorf("failed to provision: %w", err)
 	}
 
-	// Create stream with scheduled delivery support. The Duplicates window
-	// pairs with the per-message Nats-Msg-Id set by publishScheduledMessage
-	// to suppress duplicate publishes — most importantly the ones produced
-	// when several peers each run loadJobsFromKV at startup.
-	if err := s.startPhase(ctx, "create-stream", func(c context.Context) error {
-		st, e := s.js.CreateOrUpdateStream(c, jetstream.StreamConfig{
-			Name:              s.streamName,
-			Subjects:          []string{s.subjectPrefix + ".>"},
-			AllowMsgSchedules: true,
-			Retention:         jetstream.WorkQueuePolicy,
-			Duplicates:        s.duplicatesWindow,
-		})
-		if e != nil {
-			return e
-		}
-		s.stream = st
-		return nil
-	}); err != nil {
-		return fmt.Errorf("failed to create stream: %w", err)
+	jobKV, err := s.js.KeyValue(ctx, s.jobBucket)
+	if err != nil {
+		return fmt.Errorf("failed to lookup job KV bucket: %w", err)
 	}
+	s.jobKV = jobKV
+	execKV, err := s.js.KeyValue(ctx, s.execBucket)
+	if err != nil {
+		return fmt.Errorf("failed to lookup exec KV bucket: %w", err)
+	}
+	s.execKV = execKV
+	st, err := s.js.Stream(ctx, s.streamName)
+	if err != nil {
+		return fmt.Errorf("failed to lookup stream: %w", err)
+	}
+	s.stream = st
 
 	// Verify the server actually applied AllowMsgSchedules.
 	// Older servers silently ignore unknown fields instead of returning an error.
@@ -537,21 +568,19 @@ func (s *natsSchedulerImpl) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to load jobs: %w", err)
 	}
 
-	// Create fresh consumer for receiving scheduled messages
+	// Consumer was provisioned inside the merged Once block above;
+	// here we just look it up. Lookup is a plain metadata read that
+	// cannot hang on the multi-pod reply-path race.
 	var consumer jetstream.Consumer
-	if err := s.startPhase(ctx, "create-consumer", func(c context.Context) error {
-		cons, e := s.stream.CreateOrUpdateConsumer(c, jetstream.ConsumerConfig{
-			Durable:   s.consumerName,
-			AckPolicy: jetstream.AckExplicitPolicy,
-			AckWait:   5 * time.Minute,
-		})
+	if err := s.startPhase(ctx, "lookup-consumer", func(c context.Context) error {
+		cons, e := s.stream.Consumer(c, s.consumerName)
 		if e != nil {
 			return e
 		}
 		consumer = cons
 		return nil
 	}); err != nil {
-		return fmt.Errorf("failed to create consumer: %w", err)
+		return fmt.Errorf("failed to lookup consumer: %w", err)
 	}
 
 	s.ctx, s.cancel = context.WithCancel(ctx)
@@ -1408,16 +1437,20 @@ func (s *natsSchedulerImpl) logError(msg string, keysAndValues ...any) {
 //
 // This is the fix for the multi-instance brand-new-deployment hang. nats.go
 // documents on AccountInfo: "For clustered topologies, AccountInfo will
-// time out." Every JetStream API used by Start (CreateOrUpdateKeyValue,
-// CreateOrUpdateStream, CreateOrUpdateConsumer) calls AccountInfo
-// internally — so until the metaleader is elected, the very first KV/stream
-// create hangs for the caller's whole ctx deadline (commonly minutes).
+// time out." Every JetStream API used by NATSScheduler.Start /
+// NATSStorage.Initialize (CreateOrUpdateKeyValue, CreateOrUpdateStream,
+// CreateOrUpdateConsumer) calls AccountInfo internally — so until the
+// metaleader is elected, the very first KV/stream create hangs for the
+// caller's whole ctx deadline (commonly minutes).
 //
 // Each probe is capped at 2 s so a server that swallows the request without
 // reply cannot consume the overall budget. Backoff doubles 100 ms → 500 ms.
 // ErrJetStreamNotEnabled and ErrJetStreamNotEnabledForAccount are terminal
 // (the cluster will not become ready by retrying) and returned immediately.
-func (s *natsSchedulerImpl) waitForJetStreamReady(ctx context.Context, timeout time.Duration) error {
+//
+// Shared by NATSScheduler.Start and NATSStorage.Initialize so both gate any
+// JetStream API call behind the same metaleader-ready check.
+func waitForJetStreamReady(ctx context.Context, js jetstream.JetStream, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	backoff := 100 * time.Millisecond
 	var lastErr error
@@ -1440,7 +1473,7 @@ func (s *natsSchedulerImpl) waitForJetStreamReady(ctx context.Context, timeout t
 			callTimeout = remaining
 		}
 		callCtx, cancel := context.WithTimeout(ctx, callTimeout)
-		_, err := s.js.AccountInfo(callCtx)
+		_, err := js.AccountInfo(callCtx)
 		cancel()
 		if err == nil {
 			return nil
