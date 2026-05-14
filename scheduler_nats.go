@@ -97,6 +97,21 @@ const (
 	// instantly, on a still-electing cluster it returns the moment the
 	// metaleader is up.
 	defaultJetStreamReadyTimeout = 30 * time.Second
+
+	// defaultLoadJobsConcurrency is the number of worker goroutines
+	// loadJobsFromKV uses to parallelize KV reads and async scheduled-message
+	// publishes at startup. With this many in-flight KV.Get round-trips and
+	// the JetStream client's default 4000-deep async publish pipeline,
+	// startup of an N-job deployment drops from O(N * RTT) to roughly
+	// O((N / concurrency) * RTT) for the KV reads, with the publishes
+	// effectively overlapped behind them.
+	defaultLoadJobsConcurrency = 32
+
+	// defaultLoadJobsAsyncPublishTimeout bounds how long loadJobsFromKV
+	// waits for in-flight async PublishMsgAsync calls to be acked by the
+	// stream leader before declaring the load complete. The reconciler
+	// catches any straggler that misses this window.
+	defaultLoadJobsAsyncPublishTimeout = 30 * time.Second
 )
 
 // ErrNATSServerTooOld indicates the connected NATS server does not support
@@ -318,6 +333,53 @@ func WithStartPhaseTimeout(timeout time.Duration) NATSSchedulerOption {
 	}
 }
 
+// WithLoadJobsConcurrency sets the number of worker goroutines used by
+// loadJobsFromKV during Start() to parallelize KV reads and async
+// scheduled-message publishes for persisted jobs.
+//
+// Each worker does a sync jobKV.Get + (optional) jobKV.Update + a fire-and-
+// forget PublishMsgAsync for one job before pulling the next key. The
+// JetStream client itself pipelines the asyncs behind the scenes, so the
+// publish stage is effectively free; this option controls how many KV reads
+// run in parallel.
+//
+// Higher values cut startup time on deployments with hundreds or thousands
+// of persisted jobs (O(N*RTT) → O(N/concurrency * RTT)). Values below 1 are
+// treated as 1 (no parallelism). The default is 32, comfortable for most
+// clusters; raise it only if you have measured KV.Get latency dominating
+// Start() time.
+//
+// Note on error visibility: per-message publish ack errors at startup are
+// not logged by the scheduler (the reconciler is the safety net — any job
+// whose scheduled message never landed will be republished within the
+// reconciler interval). If you want per-message visibility, install
+// jetstream.WithPublishAsyncErrHandler on the JetStream client you pass to
+// NewNATSScheduler — that handler fires for every async publish whose ack
+// fails or times out.
+func WithLoadJobsConcurrency(n int) NATSSchedulerOption {
+	return func(s *natsSchedulerImpl) {
+		if n < 1 {
+			n = 1
+		}
+		s.loadJobsConcurrency = n
+	}
+}
+
+// WithLoadJobsAsyncPublishTimeout bounds how long loadJobsFromKV waits at
+// the end of Start() for outstanding async PublishMsgAsync calls to be
+// acked. A timeout here does not break correctness — the background
+// reconciler will republish any persisted job whose next-tick message was
+// lost or never acked — but it is logged so operators can spot a cluster
+// that is slow to ack startup publishes.
+//
+// timeout <= 0 disables the wait (workers exit and Start() returns as soon
+// as the last PublishMsgAsync has been enqueued).
+func WithLoadJobsAsyncPublishTimeout(timeout time.Duration) NATSSchedulerOption {
+	return func(s *natsSchedulerImpl) {
+		s.loadJobsAsyncPublishTimeout = timeout
+	}
+}
+
 // WithReconcilerGracePeriod sets the lag tolerance the reconciler applies
 // before treating a job as stuck. A job is republished only if its KV
 // NextRun is older than now - gracePeriod. The default is 30 s, large enough
@@ -376,6 +438,12 @@ type natsSchedulerImpl struct {
 	reconcilerGrace    time.Duration
 	reconcilerWG       sync.WaitGroup
 
+	// loadJobsConcurrency caps how many worker goroutines loadJobsFromKV
+	// uses to parallelize KV reads at Start(). Async PublishMsgAsync calls
+	// fired by workers pipeline through the JetStream client's own buffer.
+	loadJobsConcurrency         int
+	loadJobsAsyncPublishTimeout time.Duration
+
 	// once serializes the multi-process first-deploy race on
 	// CreateOrUpdateKeyValue / CreateOrUpdateStream /
 	// CreateOrUpdateConsumer inside Start. Defaults to a built-in
@@ -424,6 +492,9 @@ func NewNATSScheduler(js jetstream.JetStream, handler JobHandler, opts ...NATSSc
 		addJobRetryBudget:         defaultAddJobRetryBudget,
 		onceLockBucket:            defaultOnceLockBucket,
 		onceKey:                   defaultSchedulerOnceKey,
+
+		loadJobsConcurrency:         defaultLoadJobsConcurrency,
+		loadJobsAsyncPublishTimeout: defaultLoadJobsAsyncPublishTimeout,
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -1677,6 +1748,37 @@ func (s *natsSchedulerImpl) publishScheduledMessage(ctx context.Context, jobID s
 	return err
 }
 
+// publishScheduledMessageAsync is the fire-and-forget counterpart used by
+// loadJobsFromKV at startup. It enqueues the scheduled message via the
+// JetStream client's async publish pipeline and returns immediately; the
+// ack arrives later on the PubAckFuture, which we ignore here.
+//
+// Correctness is preserved by the same deterministic Nats-Msg-Id used by
+// the sync path (the stream's Duplicates window suppresses any
+// double-publish), and by the background reconciler, which will republish
+// any job whose ack never arrived.
+func (s *natsSchedulerImpl) publishScheduledMessageAsync(jobID string, scheduledAt time.Time) error {
+	subject := s.jobSubject(jobID)
+	payload, err := json.Marshal(scheduleMessage{
+		JobID:       jobID,
+		ScheduledAt: scheduledAt,
+	})
+	if err != nil {
+		return err
+	}
+
+	msg := &nats.Msg{
+		Subject: subject,
+		Data:    payload,
+		Header:  nats.Header{},
+	}
+	msg.Header.Set(natsScheduledDeliveryHeader, "@at "+scheduledAt.UTC().Format(time.RFC3339))
+	msg.Header.Set(nats.MsgIdHdr, fmt.Sprintf("%s-%d", jobID, scheduledAt.UnixNano()))
+
+	_, err = s.js.PublishMsgAsync(msg)
+	return err
+}
+
 // jobSubject returns the NATS subject for a given job ID.
 func (s *natsSchedulerImpl) jobSubject(jobID string) string {
 	return s.subjectPrefix + ".jobs." + jobID
@@ -1729,7 +1831,29 @@ func (s *natsSchedulerImpl) loadJobFromKV(ctx context.Context, id string) (*jobI
 	}, nil
 }
 
-// loadJobsFromKV loads persisted jobs from KV store and publishes scheduled messages for them.
+// loadJobsFromKV loads persisted jobs from KV store and publishes scheduled
+// messages for them.
+//
+// Hot-path optimisation: instead of a single goroutine doing
+// Get → decode → Update → sync-Publish per key, we spawn a small worker pool
+// to parallelize the KV round-trips and fire each scheduled message via the
+// JetStream client's async publish pipeline. For N persisted jobs this
+// brings Start() from O(N * RTT) down to roughly O((N / concurrency) * RTT)
+// for the reads, with the publishes effectively overlapped behind them.
+//
+// Concurrency control:
+//   - Worker count is min(s.loadJobsConcurrency, len(keys)); for small key
+//     sets we never spawn more workers than there is work.
+//   - Workers run per-key processing concurrently. They never touch s.jobs
+//     directly; results flow through jobCh to a single collector goroutine
+//     that owns the map writes. This avoids needing a separate lock — Start
+//     already holds s.mu exclusively for the duration of loadJobsFromKV.
+//   - Async publishes are throttled by the JetStream client's built-in
+//     max-pending buffer (PublishMsgAsync blocks once that fills up), so
+//     no separate semaphore is needed for that stage.
+//   - After workers finish, we wait up to loadJobsAsyncPublishTimeout for
+//     PublishAsyncComplete to fire. A timeout is non-fatal: the reconciler
+//     republishes any straggler that never acked.
 func (s *natsSchedulerImpl) loadJobsFromKV(ctx context.Context) error {
 	keys, err := s.jobKV.Keys(ctx)
 	if err != nil {
@@ -1738,99 +1862,172 @@ func (s *natsSchedulerImpl) loadJobsFromKV(ctx context.Context) error {
 		}
 		return err
 	}
+	if len(keys) == 0 {
+		return nil
+	}
 
 	now := time.Now()
+
+	concurrency := s.loadJobsConcurrency
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	if concurrency > len(keys) {
+		concurrency = len(keys)
+	}
+
+	keyCh := make(chan string, concurrency)
+	jobCh := make(chan *jobImpl, concurrency)
+
+	var workerWG sync.WaitGroup
+	for i := 0; i < concurrency; i++ {
+		workerWG.Add(1)
+		go func() {
+			defer workerWG.Done()
+			for key := range keyCh {
+				if job := s.loadAndPublishOneJob(ctx, key, now); job != nil {
+					jobCh <- job
+				}
+			}
+		}()
+	}
+
+	collectDone := make(chan struct{})
+	go func() {
+		defer close(collectDone)
+		for job := range jobCh {
+			s.jobs[job.id] = job
+		}
+	}()
+
+	var feedErr error
+feedLoop:
 	for _, key := range keys {
-		entry, err := s.jobKV.Get(ctx, key)
-		if err != nil {
-			s.logError("startup: failed to read job KV entry",
-				"key", key, "err", err)
-			continue
+		select {
+		case <-ctx.Done():
+			feedErr = ctx.Err()
+			break feedLoop
+		case keyCh <- key:
 		}
+	}
+	close(keyCh)
+	workerWG.Wait()
+	close(jobCh)
+	<-collectDone
 
-		var jv natsJobValue
-		if err := json.Unmarshal(entry.Value(), &jv); err != nil {
-			s.logError("startup: failed to decode job KV entry",
-				"key", key, "err", err)
-			continue
-		}
+	if feedErr != nil {
+		return feedErr
+	}
 
-		schedule, err := s.codec.Decode(jv.ScheduleType, jv.ScheduleConfig)
-		if err != nil {
-			s.logError("startup: failed to decode schedule",
-				"job_id", jv.ID, "schedule_type", jv.ScheduleType, "err", err)
-			continue
-		}
-
-		// Skip completed one-time schedules: if the run time has passed,
-		// the job was already executed and should not be rescheduled.
-		if onceSchedule, ok := schedule.(*OnceSchedule); ok {
-			if !onceSchedule.RunAt().After(now) {
-				// Still load into memory for GetJob/ListJobs but don't schedule
-				s.jobs[jv.ID] = &jobImpl{
-					id:        jv.ID,
-					schedule:  schedule,
-					metadata:  copyMetadata(jv.Metadata),
-					nextRun:   onceSchedule.RunAt(),
-					lastRun:   jv.LastRun,
-					createdAt: jv.CreatedAt,
-				}
-				continue
-			}
-		}
-
-		nextRun := jv.NextRun
-		recomputed := false
-		if nextRun.Before(now) {
-			nextRun = schedule.Next(now)
-			recomputed = true
-		}
-
-		job := &jobImpl{
-			id:        jv.ID,
-			schedule:  schedule,
-			metadata:  copyMetadata(jv.Metadata),
-			nextRun:   nextRun,
-			lastRun:   jv.LastRun,
-			createdAt: jv.CreatedAt,
-		}
-		s.jobs[jv.ID] = job
-
-		// Persist the recomputed NextRun back to KV so handleMessage's
-		// KV-based stale-msg check (scheduledAt < KV.NextRun) can reject
-		// any stream-resident message left over from the previous run.
-		//
-		// CAS-guarded with the revision we read above: if another peer (or
-		// this peer's own handler completing concurrently) wrote a fresher
-		// value between our Get and Update, the Update returns ErrKeyExists
-		// (same JSErrCodeStreamWrongLastSequence wrapper Create uses) and
-		// we skip silently — the racer already established a NextRun at
-		// least as recent as ours, which is exactly what the stale-msg
-		// guard needs. Falling back to Put would clobber LastRun/Status
-		// written by the racer.
-		if recomputed {
-			jv.NextRun = nextRun
-			jv.UpdatedAt = now
-			if data, mErr := json.Marshal(&jv); mErr == nil {
-				if _, pErr := s.jobKV.Update(ctx, jv.ID, data, entry.Revision()); pErr != nil {
-					if !errors.Is(pErr, jetstream.ErrKeyExists) {
-						s.logError("startup: failed to persist recomputed next-run to KV",
-							"job_id", jv.ID, "next_run", nextRun, "err", pErr)
-					}
-				}
-			} else {
-				s.logError("startup: failed to marshal recomputed job value",
-					"job_id", jv.ID, "err", mErr)
-			}
-		}
-
-		if err := s.publishScheduledMessage(ctx, jv.ID, nextRun); err != nil {
-			s.logError("startup: failed to publish scheduled message",
-				"job_id", jv.ID, "next_run", nextRun, "err", err)
+	// Drain in-flight async publishes. A timeout is non-fatal — the
+	// background reconciler will republish any job whose ack never arrived,
+	// dedupe header on the message keeps it safe.
+	if s.loadJobsAsyncPublishTimeout > 0 {
+		select {
+		case <-s.js.PublishAsyncComplete():
+		case <-time.After(s.loadJobsAsyncPublishTimeout):
+			s.logError("startup: timed out waiting for async publish drain",
+				"timeout", s.loadJobsAsyncPublishTimeout,
+				"pending", s.js.PublishAsyncPending())
+		case <-ctx.Done():
+			return ctx.Err()
 		}
 	}
 
 	return nil
+}
+
+// loadAndPublishOneJob handles a single KV key during startup: read the
+// entry, decode the schedule, recompute NextRun if it's already past, write
+// the recomputed value back to KV under CAS, and fire-and-forget the next
+// scheduled message via PublishMsgAsync. Returns the jobImpl to install
+// into s.jobs, or nil if the entry was unreadable / undecodable.
+func (s *natsSchedulerImpl) loadAndPublishOneJob(ctx context.Context, key string, now time.Time) *jobImpl {
+	entry, err := s.jobKV.Get(ctx, key)
+	if err != nil {
+		s.logError("startup: failed to read job KV entry",
+			"key", key, "err", err)
+		return nil
+	}
+
+	var jv natsJobValue
+	if err := json.Unmarshal(entry.Value(), &jv); err != nil {
+		s.logError("startup: failed to decode job KV entry",
+			"key", key, "err", err)
+		return nil
+	}
+
+	schedule, err := s.codec.Decode(jv.ScheduleType, jv.ScheduleConfig)
+	if err != nil {
+		s.logError("startup: failed to decode schedule",
+			"job_id", jv.ID, "schedule_type", jv.ScheduleType, "err", err)
+		return nil
+	}
+
+	// Skip completed one-time schedules: if the run time has passed,
+	// the job was already executed and should not be rescheduled.
+	if onceSchedule, ok := schedule.(*OnceSchedule); ok {
+		if !onceSchedule.RunAt().After(now) {
+			return &jobImpl{
+				id:        jv.ID,
+				schedule:  schedule,
+				metadata:  copyMetadata(jv.Metadata),
+				nextRun:   onceSchedule.RunAt(),
+				lastRun:   jv.LastRun,
+				createdAt: jv.CreatedAt,
+			}
+		}
+	}
+
+	nextRun := jv.NextRun
+	recomputed := false
+	if nextRun.Before(now) {
+		nextRun = schedule.Next(now)
+		recomputed = true
+	}
+
+	job := &jobImpl{
+		id:        jv.ID,
+		schedule:  schedule,
+		metadata:  copyMetadata(jv.Metadata),
+		nextRun:   nextRun,
+		lastRun:   jv.LastRun,
+		createdAt: jv.CreatedAt,
+	}
+
+	// Persist the recomputed NextRun back to KV so handleMessage's
+	// KV-based stale-msg check (scheduledAt < KV.NextRun) can reject
+	// any stream-resident message left over from the previous run.
+	//
+	// CAS-guarded with the revision we read above: if another peer (or
+	// this peer's own handler completing concurrently) wrote a fresher
+	// value between our Get and Update, the Update returns ErrKeyExists
+	// (same JSErrCodeStreamWrongLastSequence wrapper Create uses) and
+	// we skip silently — the racer already established a NextRun at
+	// least as recent as ours, which is exactly what the stale-msg
+	// guard needs. Falling back to Put would clobber LastRun/Status
+	// written by the racer.
+	if recomputed {
+		jv.NextRun = nextRun
+		jv.UpdatedAt = now
+		if data, mErr := json.Marshal(&jv); mErr == nil {
+			if _, pErr := s.jobKV.Update(ctx, jv.ID, data, entry.Revision()); pErr != nil {
+				if !errors.Is(pErr, jetstream.ErrKeyExists) {
+					s.logError("startup: failed to persist recomputed next-run to KV",
+						"job_id", jv.ID, "next_run", nextRun, "err", pErr)
+				}
+			}
+		} else {
+			s.logError("startup: failed to marshal recomputed job value",
+				"job_id", jv.ID, "err", mErr)
+		}
+	}
+
+	if err := s.publishScheduledMessageAsync(jv.ID, nextRun); err != nil {
+		s.logError("startup: failed to enqueue async scheduled message",
+			"job_id", jv.ID, "next_run", nextRun, "err", err)
+	}
+	return job
 }
 
 // checkNATSServerVersion verifies that the connected NATS server supports
