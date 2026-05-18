@@ -1034,7 +1034,13 @@ func (s *natsSchedulerImpl) handleMessage(msg jetstream.Msg) {
 	s.mu.RUnlock()
 
 	if !running {
-		_ = msg.Ack()
+		// This peer is stopping. Ack would delete the message from the
+		// WorkQueue and nobody else would ever process it — the chain
+		// would die until the reconciler advances NextRun on a future
+		// sweep. Nak so another peer (multi-pod) can take it; in a
+		// single-pod deployment the reconciler still heals via the
+		// CAS-advance path within one sweep.
+		_ = msg.Nak()
 		return
 	}
 
@@ -1384,13 +1390,19 @@ func (s *natsSchedulerImpl) waitForBackingStreams(ctx context.Context, timeout t
 	return nil
 }
 
-// runReconciler periodically scans the job KV and republishes the scheduled
-// message for any recurring job whose KV NextRun is older than the grace
-// period. Safe to run concurrently with executeJob and other peers: the
-// per-message Nats-Msg-Id (jobID, scheduledAt) combined with the stream's
-// Duplicates window suppresses the republish when the original scheduled
-// message is still alive. When the chain is genuinely broken (the next-tick
-// publish failed silently), the republish restores it.
+// runReconciler periodically scans the job KV and resurrects any recurring
+// job whose KV NextRun is older than the grace period. For each stale row it
+// recomputes a fresh NextRun from the schedule, writes it back via a CAS
+// (revision-guarded) update, and publishes a scheduled message at the new
+// NextRun. Because the new scheduledAt yields a different deterministic
+// Nats-Msg-Id, the republish bypasses the stream's Duplicates window — so
+// even if a previous tick was acked-without-rescheduling (handler panic,
+// silent drop, exhausted publish retries) the chain recovers within one
+// sweep. The CAS guard ensures at most one writer advances NextRun even
+// when multiple peers race; the losers skip and let the winner own the tick.
+// Any in-flight stream message with the now-stale scheduledAt is then
+// self-cleaned by handleMessage's KV validation (scheduledAt < KV.NextRun
+// → ack-drop).
 func (s *natsSchedulerImpl) runReconciler(ctx context.Context, interval time.Duration) {
 	defer s.reconcilerWG.Done()
 
@@ -1472,20 +1484,52 @@ func (s *natsSchedulerImpl) reconcileOnce(ctx context.Context) {
 			continue
 		}
 
-		// Republish with the EXACT KV NextRun so the deterministic Msg-Id
-		// matches the original publish. If that original is still alive in
-		// the stream (i.e. the chain was actually fine and KV is just lagging
-		// our peer), the Duplicates window suppresses this republish.
-		if err := s.publishScheduledMessage(ctx, jv.ID, jv.NextRun); err != nil {
-			// Same shutdown-noise suppression as the Keys() path above.
-			if ctx.Err() == nil {
-				s.logError("reconciler: republish failed",
-					"job_id", jv.ID, "next_run", jv.NextRun, "err", err)
+		// Advance NextRun by recomputing from the schedule against now.
+		// Republishing the same KV.NextRun would collide on Nats-Msg-Id and
+		// be silently suppressed by the Duplicates window — the very case
+		// that left chains dead before. A fresh scheduledAt gives a fresh
+		// Msg-Id and actually lands.
+		now := time.Now()
+		freshNext := schedule.Next(now)
+		if freshNext.IsZero() || !freshNext.After(now) {
+			// Defensive: schedule has nothing more to deliver (e.g. a
+			// pathological cron). Leave the row for human inspection
+			// rather than republishing forever.
+			continue
+		}
+		staleNext := jv.NextRun
+		jv.NextRun = freshNext
+		jv.UpdatedAt = now
+		data, mErr := json.Marshal(&jv)
+		if mErr != nil {
+			s.logError("reconciler: marshal advanced KV value failed",
+				"job_id", jv.ID, "err", mErr)
+			continue
+		}
+		// CAS via the revision we just read. If another peer (or this
+		// peer's own executeJob) wrote a fresher value between our Get
+		// and Update, the Update returns ErrKeyExists and we silently
+		// skip — the racer already established a NextRun at least as
+		// recent as ours, so the chain is alive.
+		if _, err := s.jobKV.Update(ctx, key, data, entry.Revision()); err != nil {
+			if !errors.Is(err, jetstream.ErrKeyExists) && ctx.Err() == nil {
+				s.logError("reconciler: CAS update KV failed",
+					"job_id", jv.ID, "next_run", freshNext, "err", err)
 			}
 			continue
 		}
-		s.logError("reconciler: republished stale next-tick",
-			"job_id", jv.ID, "next_run", jv.NextRun)
+		if err := s.publishScheduledMessage(ctx, jv.ID, freshNext); err != nil {
+			// Same shutdown-noise suppression as the Keys() path above.
+			// KV is already advanced; the next reconciler sweep will
+			// retry the publish if this one failed transiently.
+			if ctx.Err() == nil {
+				s.logError("reconciler: publish advanced next-tick failed",
+					"job_id", jv.ID, "next_run", freshNext, "err", err)
+			}
+			continue
+		}
+		s.logError("reconciler: advanced stale next-tick",
+			"job_id", jv.ID, "stale_next_run", staleNext, "fresh_next_run", freshNext)
 	}
 }
 
