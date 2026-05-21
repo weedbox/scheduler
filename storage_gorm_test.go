@@ -3,6 +3,7 @@ package scheduler
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -19,12 +20,24 @@ import (
 // connection its own private database, which breaks any test that does
 // concurrent operations (the goroutines inside the scheduler) or opens a
 // second storage handle on the same logical DB.
+//
+// The DSN name is qualified with a per-test counter so re-running the same
+// test (e.g., `go test -count=N`) doesn't pick up state from the previous
+// iteration via the shared cache. We also close the underlying SQL DB on
+// cleanup so the cache entry is released.
 func setupTestDB(t *testing.T) *gorm.DB {
-	dsn := fmt.Sprintf("file:%s?mode=memory&cache=shared", t.Name())
+	dsn := fmt.Sprintf("file:%s_%d?mode=memory&cache=shared", t.Name(), testDBCounter.Add(1))
 	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
 	require.NoError(t, err)
+	t.Cleanup(func() {
+		if sqlDB, dbErr := db.DB(); dbErr == nil {
+			_ = sqlDB.Close()
+		}
+	})
 	return db
 }
+
+var testDBCounter atomic.Uint64
 
 // TestGormStorageInitialize tests the Initialize method
 func TestGormStorageInitialize(t *testing.T) {
