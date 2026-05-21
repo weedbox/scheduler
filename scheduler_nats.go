@@ -51,15 +51,6 @@ const (
 	// Wider than the previous 10 s so the retry budget fits.
 	defaultPostHandlerTimeout = 60 * time.Second
 
-	// defaultStartupStreamReadyTimeout bounds how long Start() waits for the
-	// SCHEDULER stream and the KV backing streams to have a raft leader
-	// before continuing to loadJobsFromKV. In multi-node JetStream clusters
-	// CreateOrUpdateStream / CreateOrUpdateKeyValue return as soon as the
-	// metaleader has accepted the config, so the asset's own raft group may
-	// still be electing a leader — any publish/KV call issued in that
-	// window returns nats: no responders available for request.
-	defaultStartupStreamReadyTimeout = 30 * time.Second
-
 	// defaultReconcilerInterval is how often the background reconciler scans
 	// the job KV for chains whose next-tick publish was lost. Enabled by
 	// default so a single dropped publish does not silently kill a recurring
@@ -268,27 +259,6 @@ func WithAddJobRetryBudget(budget time.Duration) NATSSchedulerOption {
 	}
 }
 
-// WithStartupStreamReadyTimeout bounds how long Start() waits for the
-// SCHEDULER stream and KV backing streams to have a raft leader before
-// proceeding to load persisted jobs.
-//
-// In multi-node JetStream clusters, CreateOrUpdateStream and
-// CreateOrUpdateKeyValue return as soon as the metaleader has accepted the
-// config — the asset's own raft group may still be electing a leader, so a
-// publishScheduledMessage or KV Keys/Get call issued in that window returns
-// nats: no responders available for request. Without this wait,
-// loadJobsFromKV would silently or noisily drop the first startup publish
-// for every persisted job until the chain naturally re-fires (it doesn't,
-// because the chain is the publish we just lost).
-//
-// timeout <= 0 disables the wait. Single-node JetStream (no Cluster info)
-// is treated as ready immediately.
-func WithStartupStreamReadyTimeout(timeout time.Duration) NATSSchedulerOption {
-	return func(s *natsSchedulerImpl) {
-		s.startupStreamReadyTimeout = timeout
-	}
-}
-
 // WithJetStreamReadyTimeout bounds how long Start() waits for the
 // JetStream metaleader to be reachable before issuing the first KV /
 // stream / consumer create.
@@ -316,8 +286,8 @@ func WithJetStreamReadyTimeout(timeout time.Duration) NATSSchedulerOption {
 }
 
 // WithStartPhaseTimeout caps each individual NATS API call inside Start
-// (KV bucket creation, stream creation, backing-stream wait, persisted-job
-// load, consumer creation, initial Consume subscribe). Without this cap a
+// (KV bucket convergence, stream convergence, consumer convergence,
+// persisted-job load, initial Consume subscribe). Without this cap a
 // single hung JetStream API request consumes the caller's entire Start
 // context — typical callers pass several minutes, so the hang surfaces 5+
 // minutes later with no indication of which phase blocked.
@@ -425,14 +395,13 @@ type natsSchedulerImpl struct {
 	// hiccup (typically a raft leader re-election). Zero disables retry.
 	addJobRetryBudget time.Duration
 
-	logger                    NATSSchedulerLogger
-	onRescheduleFailed        RescheduleFailureFunc
-	publishAttempts           int
-	publishRetryBackoff       time.Duration
-	postHandlerTimeout        time.Duration
-	jetStreamReadyTimeout     time.Duration
-	startupStreamReadyTimeout time.Duration
-	startPhaseTimeout         time.Duration
+	logger                NATSSchedulerLogger
+	onRescheduleFailed    RescheduleFailureFunc
+	publishAttempts       int
+	publishRetryBackoff   time.Duration
+	postHandlerTimeout    time.Duration
+	jetStreamReadyTimeout time.Duration
+	startPhaseTimeout     time.Duration
 
 	reconcilerInterval time.Duration
 	reconcilerGrace    time.Duration
@@ -443,15 +412,6 @@ type natsSchedulerImpl struct {
 	// fired by workers pipeline through the JetStream client's own buffer.
 	loadJobsConcurrency         int
 	loadJobsAsyncPublishTimeout time.Duration
-
-	// once serializes the multi-process first-deploy race on
-	// CreateOrUpdateKeyValue / CreateOrUpdateStream /
-	// CreateOrUpdateConsumer inside Start. Defaults to a built-in
-	// JetStream-KV-backed implementation; WithOnce overrides for callers
-	// that already operate a distributed-lock service.
-	once           OnceFunc
-	onceLockBucket string
-	onceKey        string
 }
 
 // NewNATSScheduler creates a new Scheduler backed by NATS JetStream.
@@ -470,28 +430,25 @@ type natsSchedulerImpl struct {
 //	s.Start(ctx)
 func NewNATSScheduler(js jetstream.JetStream, handler JobHandler, opts ...NATSSchedulerOption) Scheduler {
 	s := &natsSchedulerImpl{
-		jobs:                      make(map[string]*jobImpl),
-		handler:                   handler,
-		codec:                     NewBasicScheduleCodec(),
-		js:                        js,
-		startReady:                make(chan struct{}),
-		streamName:                defaultNATSStreamName,
-		subjectPrefix:             defaultNATSSubjectPrefix,
-		consumerName:              defaultNATSConsumerName,
-		jobBucket:                 defaultNATSJobBucket,
-		execBucket:                defaultNATSExecBucket,
-		duplicatesWindow:          defaultStreamDuplicatesWindow,
-		publishAttempts:           defaultPublishAttempts,
-		publishRetryBackoff:       defaultPublishRetryBackoff,
-		postHandlerTimeout:        defaultPostHandlerTimeout,
-		jetStreamReadyTimeout:     defaultJetStreamReadyTimeout,
-		startupStreamReadyTimeout: defaultStartupStreamReadyTimeout,
-		startPhaseTimeout:         defaultStartPhaseTimeout,
-		reconcilerInterval:        defaultReconcilerInterval,
-		reconcilerGrace:           30 * time.Second,
-		addJobRetryBudget:         defaultAddJobRetryBudget,
-		onceLockBucket:            defaultOnceLockBucket,
-		onceKey:                   defaultSchedulerOnceKey,
+		jobs:                  make(map[string]*jobImpl),
+		handler:               handler,
+		codec:                 NewBasicScheduleCodec(),
+		js:                    js,
+		startReady:            make(chan struct{}),
+		streamName:            defaultNATSStreamName,
+		subjectPrefix:         defaultNATSSubjectPrefix,
+		consumerName:          defaultNATSConsumerName,
+		jobBucket:             defaultNATSJobBucket,
+		execBucket:            defaultNATSExecBucket,
+		duplicatesWindow:      defaultStreamDuplicatesWindow,
+		publishAttempts:       defaultPublishAttempts,
+		publishRetryBackoff:   defaultPublishRetryBackoff,
+		postHandlerTimeout:    defaultPostHandlerTimeout,
+		jetStreamReadyTimeout: defaultJetStreamReadyTimeout,
+		startPhaseTimeout:     defaultStartPhaseTimeout,
+		reconcilerInterval:    defaultReconcilerInterval,
+		reconcilerGrace:       30 * time.Second,
+		addJobRetryBudget:     defaultAddJobRetryBudget,
 
 		loadJobsConcurrency:         defaultLoadJobsConcurrency,
 		loadJobsAsyncPublishTimeout: defaultLoadJobsAsyncPublishTimeout,
@@ -536,92 +493,77 @@ func (s *natsSchedulerImpl) Start(ctx context.Context) error {
 		}
 	}
 
-	// Resolve the Once primitive used to serialize first-deploy
-	// CreateOrUpdate* races. WithOnce wins if the caller installed one;
-	// otherwise build the JetStream-KV-backed default lazily here so the
-	// allocation is paid only by callers that actually Start the
-	// scheduler.
-	if s.once == nil {
-		s.once = newOnceStore(s.js, s.onceLockBucket).Do
-	}
-
-	// Single Once block keyed "scheduler.init" wraps every first-deploy
-	// CreateOrUpdate*. Concurrent peers serialize through it; the
-	// sentinel fast-paths every subsequent boot. Lookups run outside —
-	// they're plain metadata reads that cannot hang on the reply-path
-	// race, and keeping them separate preserves per-step error context.
-	if err := s.startPhase(ctx, "provision", func(c context.Context) error {
-		return s.once(c, s.onceKey, func(c context.Context) error {
-			if _, e := s.js.CreateOrUpdateKeyValue(c, jetstream.KeyValueConfig{
-				Bucket: s.jobBucket,
-			}); e != nil {
-				return fmt.Errorf("create job KV: %w", e)
-			}
-			if _, e := s.js.CreateOrUpdateKeyValue(c, jetstream.KeyValueConfig{
-				Bucket: s.execBucket,
-			}); e != nil {
-				return fmt.Errorf("create exec KV: %w", e)
-			}
-			if _, e := s.js.CreateOrUpdateStream(c, jetstream.StreamConfig{
-				Name:              s.streamName,
-				Subjects:          []string{s.subjectPrefix + ".>"},
-				AllowMsgSchedules: true,
-				Retention:         jetstream.WorkQueuePolicy,
-				Duplicates:        s.duplicatesWindow,
-			}); e != nil {
-				return fmt.Errorf("create stream: %w", e)
-			}
-			st, e := s.js.Stream(c, s.streamName)
-			if e != nil {
-				return fmt.Errorf("lookup stream for consumer create: %w", e)
-			}
-			if _, e := st.CreateOrUpdateConsumer(c, jetstream.ConsumerConfig{
-				Durable:   s.consumerName,
-				AckPolicy: jetstream.AckExplicitPolicy,
-				AckWait:   5 * time.Minute,
-			}); e != nil {
-				return fmt.Errorf("create consumer: %w", e)
-			}
-			return nil
-		})
+	// Provision the four resources via polite-retry-until-convergent
+	// helpers. Each helper independently loops on its asset until the
+	// server reports it ready (per-stream Raft leader elected, replicas
+	// current), so concurrent peers don't need external coordination —
+	// the NATS server's meta-leader serializes CreateOrUpdate* by name.
+	//
+	// EnsureKVConvergent / EnsureStreamConvergent / EnsureConsumerConvergent
+	// also absorb transient cold-start errors and "already in use" races
+	// from peer creates, and EnsureKVConvergent / EnsureStreamConvergent
+	// fall back to a single replica on insufficient-peers (single-node
+	// dev) then opportunistically promote back to defaultReplicas once
+	// the cluster grows.
+	//
+	// Each call is wrapped in a startPhase so a hung JetStream API request
+	// surfaces as a phase-tagged error rather than blowing past the
+	// caller's overall ctx unattributed.
+	var (
+		jobKV    jetstream.KeyValue
+		execKV   jetstream.KeyValue
+		stream   jetstream.Stream
+		consumer jetstream.Consumer
+		convErr  error
+	)
+	if err := s.startPhase(ctx, "provision-job-kv", func(c context.Context) error {
+		jobKV, convErr = EnsureKVConvergent(c, s.js, jetstream.KeyValueConfig{
+			Bucket: s.jobBucket,
+		}, s.logger)
+		return convErr
 	}); err != nil {
-		return fmt.Errorf("failed to provision: %w", err)
+		return fmt.Errorf("failed to provision job KV: %w", err)
+	}
+	if err := s.startPhase(ctx, "provision-exec-kv", func(c context.Context) error {
+		execKV, convErr = EnsureKVConvergent(c, s.js, jetstream.KeyValueConfig{
+			Bucket: s.execBucket,
+		}, s.logger)
+		return convErr
+	}); err != nil {
+		return fmt.Errorf("failed to provision exec KV: %w", err)
+	}
+	if err := s.startPhase(ctx, "provision-stream", func(c context.Context) error {
+		stream, convErr = EnsureStreamConvergent(c, s.js, jetstream.StreamConfig{
+			Name:              s.streamName,
+			Subjects:          []string{s.subjectPrefix + ".>"},
+			AllowMsgSchedules: true,
+			Retention:         jetstream.WorkQueuePolicy,
+			Duplicates:        s.duplicatesWindow,
+		}, s.logger)
+		return convErr
+	}); err != nil {
+		return fmt.Errorf("failed to provision stream: %w", err)
+	}
+	if err := s.startPhase(ctx, "provision-consumer", func(c context.Context) error {
+		consumer, convErr = EnsureConsumerConvergent(c, stream, jetstream.ConsumerConfig{
+			Durable:   s.consumerName,
+			AckPolicy: jetstream.AckExplicitPolicy,
+			AckWait:   5 * time.Minute,
+		}, s.logger)
+		return convErr
+	}); err != nil {
+		return fmt.Errorf("failed to provision consumer: %w", err)
 	}
 
-	jobKV, err := s.js.KeyValue(ctx, s.jobBucket)
-	if err != nil {
-		return fmt.Errorf("failed to lookup job KV bucket: %w", err)
-	}
 	s.jobKV = jobKV
-	execKV, err := s.js.KeyValue(ctx, s.execBucket)
-	if err != nil {
-		return fmt.Errorf("failed to lookup exec KV bucket: %w", err)
-	}
 	s.execKV = execKV
-	st, err := s.js.Stream(ctx, s.streamName)
-	if err != nil {
-		return fmt.Errorf("failed to lookup stream: %w", err)
-	}
-	s.stream = st
+	s.stream = stream
 
 	// Verify the server actually applied AllowMsgSchedules.
 	// Older servers silently ignore unknown fields instead of returning an error.
 	if info := s.stream.CachedInfo(); info != nil && !info.Config.AllowMsgSchedules {
 		return fmt.Errorf("%w: server %s accepted the stream but did not enable AllowMsgSchedules",
 			ErrNATSServerTooOld, s.js.Conn().ConnectedServerVersion())
-	}
-
-	// Wait for the SCHEDULER stream and KV backing streams to have a raft
-	// leader before any publish or KV operation. Without this, multi-node
-	// clusters return nats: no responders available for request during the
-	// election window — silently dropping the first startup publish for
-	// every persisted job until a peer restart.
-	if s.startupStreamReadyTimeout > 0 {
-		if err := s.startPhaseUnbounded(ctx, "wait-backing-streams", func(c context.Context) error {
-			return s.waitForBackingStreams(c, s.startupStreamReadyTimeout)
-		}); err != nil {
-			return fmt.Errorf("backing streams not ready: %w", err)
-		}
 	}
 
 	// No startup purge or consumer delete. Stale messages left behind from a
@@ -637,21 +579,6 @@ func (s *natsSchedulerImpl) Start(ctx context.Context) error {
 		return s.loadJobsFromKV(c)
 	}); err != nil {
 		return fmt.Errorf("failed to load jobs: %w", err)
-	}
-
-	// Consumer was provisioned inside the merged Once block above;
-	// here we just look it up. Lookup is a plain metadata read that
-	// cannot hang on the multi-pod reply-path race.
-	var consumer jetstream.Consumer
-	if err := s.startPhase(ctx, "lookup-consumer", func(c context.Context) error {
-		cons, e := s.stream.Consumer(c, s.consumerName)
-		if e != nil {
-			return e
-		}
-		consumer = cons
-		return nil
-	}); err != nil {
-		return fmt.Errorf("failed to lookup consumer: %w", err)
 	}
 
 	s.ctx, s.cancel = context.WithCancel(ctx)
@@ -1300,96 +1227,6 @@ func (s *natsSchedulerImpl) executeJob(job *jobImpl, scheduledAt time.Time) {
 	job.mu.Unlock()
 }
 
-// waitForBackingStreams blocks until the SCHEDULER stream and both KV
-// backing streams (KV_<jobBucket>, KV_<execBucket>) report a raft leader,
-// or the timeout elapses. Single-node JetStream (where StreamInfo.Cluster
-// is nil) is treated as ready immediately.
-//
-// The poll catches three failure modes for a freshly-created asset in a
-// multi-node cluster:
-//   - stream.Info / js.Stream returns nats: no responders (asset stream not
-//     yet hosted on any peer that responds);
-//   - StreamInfo.Cluster.Leader == "" (raft group still electing);
-//   - the call itself errors with a transient JetStream API error.
-//
-// In each case the probe is retried with bounded exponential backoff.
-func (s *natsSchedulerImpl) waitForBackingStreams(ctx context.Context, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-
-	type target struct {
-		label string
-		info  func(context.Context) (*jetstream.StreamInfo, error)
-	}
-	targets := []target{
-		{
-			label: s.streamName,
-			info:  func(c context.Context) (*jetstream.StreamInfo, error) { return s.stream.Info(c) },
-		},
-	}
-	if s.jobKV != nil {
-		jobStreamName := "KV_" + s.jobBucket
-		targets = append(targets, target{
-			label: jobStreamName,
-			info: func(c context.Context) (*jetstream.StreamInfo, error) {
-				st, err := s.js.Stream(c, jobStreamName)
-				if err != nil {
-					return nil, err
-				}
-				return st.Info(c)
-			},
-		})
-	}
-	if s.execKV != nil {
-		execStreamName := "KV_" + s.execBucket
-		targets = append(targets, target{
-			label: execStreamName,
-			info: func(c context.Context) (*jetstream.StreamInfo, error) {
-				st, err := s.js.Stream(c, execStreamName)
-				if err != nil {
-					return nil, err
-				}
-				return st.Info(c)
-			},
-		})
-	}
-
-	for _, t := range targets {
-		backoff := 50 * time.Millisecond
-		for {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return ctxErr
-			}
-			remaining := time.Until(deadline)
-			if remaining <= 0 {
-				return fmt.Errorf("%s: no raft leader after %s", t.label, timeout)
-			}
-			// Cap each probe so a hung JetStream API request can't blow
-			// past the overall deadline. 2 s is enough for a healthy
-			// cluster and short enough that the retry loop stays responsive.
-			callTimeout := 2 * time.Second
-			if callTimeout > remaining {
-				callTimeout = remaining
-			}
-			infoCtx, infoCancel := context.WithTimeout(ctx, callTimeout)
-			info, err := t.info(infoCtx)
-			infoCancel()
-			if err == nil && (info.Cluster == nil || info.Cluster.Leader != "") {
-				break
-			}
-
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(backoff):
-			}
-			if backoff < 500*time.Millisecond {
-				backoff *= 2
-			}
-		}
-	}
-	return nil
-}
-
 // runReconciler periodically scans the job KV and resurrects any recurring
 // job whose KV NextRun is older than the grace period. For each stale row it
 // recomputes a fresh NextRun from the schedule, writes it back via a CAS
@@ -1622,9 +1459,9 @@ func waitForJetStreamReady(ctx context.Context, js jetstream.JetStream, timeout 
 // which is useful for diagnosing multi-instance startup hangs.
 //
 // Use this for unbounded NATS API calls (CreateOrUpdate*, Consume).
-// For phases that already manage their own timeout (waitForJetStreamReady,
-// waitForBackingStreams) use startPhaseUnbounded so the outer cap doesn't
-// silently override the user-tunable inner budget.
+// For phases that already manage their own timeout (waitForJetStreamReady)
+// use startPhaseUnbounded so the outer cap doesn't silently override the
+// user-tunable inner budget.
 func (s *natsSchedulerImpl) startPhase(ctx context.Context, name string, op func(context.Context) error) error {
 	s.logError("start: phase begin", "phase", name)
 	start := time.Now()
@@ -1649,10 +1486,10 @@ func (s *natsSchedulerImpl) startPhase(ctx context.Context, name string, op func
 }
 
 // startPhaseUnbounded is the variant of startPhase for phases that manage
-// their own timeout internally (waitForJetStreamReady,
-// waitForBackingStreams). It logs entry, exit, and elapsed time but does
-// NOT wrap ctx with s.startPhaseTimeout — that would silently truncate the
-// user-tunable inner budget when the two limits differ.
+// their own timeout internally (waitForJetStreamReady). It logs entry,
+// exit, and elapsed time but does NOT wrap ctx with s.startPhaseTimeout —
+// that would silently truncate the user-tunable inner budget when the
+// two limits differ.
 func (s *natsSchedulerImpl) startPhaseUnbounded(ctx context.Context, name string, op func(context.Context) error) error {
 	s.logError("start: phase begin", "phase", name)
 	start := time.Now()

@@ -53,46 +53,6 @@ func WithNATSStorageExecBucket(name string) NATSStorageOption {
 	}
 }
 
-// WithNATSStorageOnce installs a distributed-once implementation used to
-// serialize the first-time CreateOrUpdateKeyValue calls in Initialize across
-// processes. Storage and Scheduler use distinct keys
-// (defaultStorageOnceKey vs. defaultSchedulerOnceKey) because their fn
-// bodies provision different resource sets; sharing the same OnceFunc
-// across both is fine (recommended in cluster deployments so both
-// components serialize through the same lock substrate), but the keys
-// must stay distinct or one side's provisioning gets silently skipped.
-//
-// When unset, Initialize uses an internal JetStream-KV-backed Once with the
-// same default lock bucket name (SCHEDULER_LOCKS) as NATSScheduler, so the
-// two still share a single lock bucket across the cluster.
-func WithNATSStorageOnce(fn OnceFunc) NATSStorageOption {
-	return func(s *NATSStorage) {
-		s.once = fn
-	}
-}
-
-// WithNATSStorageOnceLockBucket overrides the JetStream KV bucket name used
-// by the built-in Once. Has no effect when WithNATSStorageOnce installed a
-// custom implementation. Defaults to SCHEDULER_LOCKS — the same default as
-// NATSScheduler so both serialize against one bucket out of the box.
-func WithNATSStorageOnceLockBucket(name string) NATSStorageOption {
-	return func(s *NATSStorage) {
-		s.onceLockBucket = name
-	}
-}
-
-// WithNATSStorageOnceKey overrides the key this package hands to its
-// OnceFunc. Defaults to defaultStorageOnceKey ("scheduler.storage-init").
-// Override when sharing a distributed-lock substrate with other modules
-// and your global naming scheme expects a different value. Keep the
-// value distinct from NATSScheduler's WithOnceKey so each component's
-// provisioning runs (see WithNATSStorageOnce).
-func WithNATSStorageOnceKey(key string) NATSStorageOption {
-	return func(s *NATSStorage) {
-		s.onceKey = key
-	}
-}
-
 // WithNATSStorageJetStreamReadyTimeout bounds how long Initialize waits for
 // the JetStream metaleader to be reachable before issuing the first KV
 // create. Same rationale as the scheduler's WithJetStreamReadyTimeout: every
@@ -112,9 +72,6 @@ type NATSStorage struct {
 	execKV                jetstream.KeyValue
 	jobBucket             string
 	execBucket            string
-	once                  OnceFunc
-	onceLockBucket        string
-	onceKey               string
 	jetStreamReadyTimeout time.Duration
 	initialized           bool
 }
@@ -125,8 +82,6 @@ func NewNATSStorage(js jetstream.JetStream, opts ...NATSStorageOption) *NATSStor
 		js:                    js,
 		jobBucket:             "SCHEDULER_JOBS",
 		execBucket:            "SCHEDULER_EXECUTIONS",
-		onceLockBucket:        defaultOnceLockBucket,
-		onceKey:               defaultStorageOnceKey,
 		jetStreamReadyTimeout: defaultJetStreamReadyTimeout,
 	}
 	for _, opt := range opts {
@@ -135,11 +90,13 @@ func NewNATSStorage(js jetstream.JetStream, opts ...NATSStorageOption) *NATSStor
 	return s
 }
 
-// Initialize creates the KV buckets and prepares the storage for use. The
-// CreateOrUpdateKeyValue calls are wrapped in Once so concurrent first-deploy
-// peers do not race the JetStream reply path (see once.go for the failure
-// mode). After Once succeeds, each peer — leader or follower — picks up the
-// bucket handle via a plain metadata lookup that cannot hang.
+// Initialize creates the KV buckets and prepares the storage for use. Both
+// CreateOrUpdateKeyValue calls run independently on every peer through
+// EnsureKVConvergent — the NATS server's meta-leader serializes by bucket
+// name, and the helper polite-retries through transient cold-start errors
+// and concurrent peer creates, fall-back to a single replica on single-node
+// deployments, then opportunistically promote back to defaultReplicas once
+// the cluster grows.
 //
 // Before any JetStream call, Initialize gates on waitForJetStreamReady so a
 // freshly-started cluster whose metaleader is still electing produces a
@@ -152,39 +109,19 @@ func (s *NATSStorage) Initialize(ctx context.Context) error {
 		}
 	}
 
-	if s.once == nil {
-		s.once = newOnceStore(s.js, s.onceLockBucket).Do
-	}
-
-	// Both KV creates share one Once block keyed s.onceKey
-	// (default "scheduler.storage-init"). Storage and Scheduler use
-	// distinct default keys so each side's CreateOrUpdate* runs;
-	// sharing the OnceFunc itself is fine and recommended in cluster
-	// deployments. CreateOrUpdateKeyValue is idempotent so a second
-	// caller against the same bucket is a no-op.
-	if err := s.once(ctx, s.onceKey, func(c context.Context) error {
-		if _, e := s.js.CreateOrUpdateKeyValue(c, jetstream.KeyValueConfig{
-			Bucket: s.jobBucket,
-		}); e != nil {
-			return e
-		}
-		if _, e := s.js.CreateOrUpdateKeyValue(c, jetstream.KeyValueConfig{
-			Bucket: s.execBucket,
-		}); e != nil {
-			return e
-		}
-		return nil
-	}); err != nil {
-		return fmt.Errorf("%w: failed to create KV buckets: %v", ErrStorageConnectionFailed, err)
-	}
-	jobKV, err := s.js.KeyValue(ctx, s.jobBucket)
+	jobKV, err := EnsureKVConvergent(ctx, s.js, jetstream.KeyValueConfig{
+		Bucket: s.jobBucket,
+	}, nil)
 	if err != nil {
-		return fmt.Errorf("%w: failed to lookup job KV bucket: %v", ErrStorageConnectionFailed, err)
+		return fmt.Errorf("%w: failed to create job KV bucket: %v", ErrStorageConnectionFailed, err)
 	}
 	s.jobKV = jobKV
-	execKV, err := s.js.KeyValue(ctx, s.execBucket)
+
+	execKV, err := EnsureKVConvergent(ctx, s.js, jetstream.KeyValueConfig{
+		Bucket: s.execBucket,
+	}, nil)
 	if err != nil {
-		return fmt.Errorf("%w: failed to lookup exec KV bucket: %v", ErrStorageConnectionFailed, err)
+		return fmt.Errorf("%w: failed to create exec KV bucket: %v", ErrStorageConnectionFailed, err)
 	}
 	s.execKV = execKV
 

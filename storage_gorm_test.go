@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -11,9 +12,16 @@ import (
 	"gorm.io/gorm"
 )
 
-// setupTestDB creates an in-memory SQLite database for testing
+// setupTestDB creates an in-memory SQLite database for testing.
+//
+// Uses a per-test named in-memory DSN with shared cache so every connection
+// in GORM's pool sees the same database. A plain ":memory:" DSN gives each
+// connection its own private database, which breaks any test that does
+// concurrent operations (the goroutines inside the scheduler) or opens a
+// second storage handle on the same logical DB.
 func setupTestDB(t *testing.T) *gorm.DB {
-	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	dsn := fmt.Sprintf("file:%s?mode=memory&cache=shared", t.Name())
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
 	require.NoError(t, err)
 	return db
 }
