@@ -22,7 +22,7 @@ A flexible and powerful job scheduler library for Go with pluggable storage back
 - 🔄 **Flexible Scheduling** - Support for interval-based, cron expressions, and one-time schedules
 - 📊 **Execution History** - Track job execution records with rich query capabilities
 - 🛡️ **Thread-Safe** - Safe for concurrent use
-- 🌐 **Distributed Ready** - Optional NATS JetStream backend with built-in distributed scheduling
+- 🌐 **Distributed Ready** - Multi-instance scheduling via NATS JetStream or PostgreSQL (`FOR UPDATE SKIP LOCKED` claims)
 - 🎯 **Production Ready** - Comprehensive test coverage
 
 ## Installation
@@ -213,6 +213,54 @@ func main() {
     select {}
 }
 ```
+
+### Using PostgreSQL (Multi-Instance)
+
+The PostgreSQL scheduler coordinates any number of instances through a shared database — no NATS and no leader election required. Due jobs are claimed with a single `FOR UPDATE SKIP LOCKED` round-trip, so exactly one instance runs each tick, and leased claims with automatic heartbeats let surviving instances take over jobs from a crashed one.
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+    "time"
+
+    "github.com/Weedbox/scheduler"
+    "gorm.io/driver/postgres"
+    "gorm.io/gorm"
+)
+
+func main() {
+    db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{})
+    if err != nil {
+        panic(err)
+    }
+
+    handler := func(ctx context.Context, event scheduler.JobEvent) error {
+        fmt.Printf("Job %s executed at %s\n", event.ID(), time.Now())
+        return nil
+    }
+
+    // Run this same program on as many instances as you like —
+    // they coordinate through the shared database.
+    sched := scheduler.NewPostgresScheduler(db, handler, scheduler.NewBasicScheduleCodec())
+
+    ctx := context.Background()
+    if err := sched.Start(ctx); err != nil {
+        panic(err)
+    }
+    defer sched.Stop(ctx)
+
+    // Same API as the other schedulers
+    schedule, _ := scheduler.NewIntervalSchedule(10 * time.Second)
+    sched.AddJob("heartbeat", schedule, map[string]string{"type": "interval"})
+
+    select {}
+}
+```
+
+> Delivery is at-least-once: a lease takeover after a crash (or a handler outliving a lost heartbeat) can re-run a tick whose completion was never recorded. Keep handlers idempotent — the same contract as the NATS scheduler.
 
 ## Core Concepts
 
@@ -464,6 +512,66 @@ NATS_URL=nats://localhost:4222 go run .
 | `WithNATSSchedulerJobBucket` | `SCHEDULER_JOBS` | KV bucket for job metadata |
 | `WithNATSSchedulerExecBucket` | `SCHEDULER_EXECUTIONS` | KV bucket for execution records |
 | `WithNATSSchedulerCodec` | `BasicScheduleCodec` | Schedule encoder/decoder |
+
+### PostgreSQL Scheduler
+
+A dedicated multi-instance scheduler that coordinates through a shared PostgreSQL database using `FOR UPDATE SKIP LOCKED` claims — the same pattern used by PostgreSQL-backed work queues.
+
+> **Requires PostgreSQL 9.5+** (for `SKIP LOCKED`). The claim query uses PostgreSQL syntax and will not work on SQLite or MySQL.
+
+```go
+db, _ := gorm.Open(postgres.Open(dsn), &gorm.Config{})
+
+sched := scheduler.NewPostgresScheduler(db, handler, scheduler.NewBasicScheduleCodec(),
+    scheduler.WithPostgresPollInterval(1*time.Second),
+    scheduler.WithPostgresLeaseDuration(5*time.Minute),
+    scheduler.WithPostgresMaxConcurrentExecutions(32),
+)
+```
+
+**How it works:**
+
+```
+NewPostgresScheduler (N instances, one shared database)
+├── Claim: UPDATE ... WHERE id = (SELECT ... WHERE next_run <= now()
+│          ... FOR UPDATE SKIP LOCKED) — one due job, exactly one winner
+├── Lease: claimed jobs carry lease_expires_at, extended by heartbeats
+│          while the handler runs; an expired lease means the owner
+│          crashed, and any instance may take the job over
+├── Fencing: every claim and every UpdateJobSchedule bumps claim_seq;
+│            completion write-backs are guarded by it (plus the row's
+│            created_at, so deleting and re-creating a job under the same
+│            ID cannot be clobbered by a stale owner either)
+└── Completion: next_run advances to schedule.Next(now) — ticks missed
+                during a full outage collapse into one catch-up run
+```
+
+The database clock is the single time authority: due-time comparisons and
+lease arithmetic run on `now()` inside the claim SQL, and `next_run` values
+are computed from a fetched database timestamp — clock skew between
+application hosts cannot shift or duplicate ticks.
+
+It reuses the `scheduler_jobs`/`scheduler_executions` tables of `GormStorage` (adding two columns on `Start`), so an existing single-node GORM deployment switches to multi-instance without a data migration — just replace `NewScheduler(NewGormStorage(db), ...)` with `NewPostgresScheduler(db, ...)`.
+
+**Comparison of the multi-instance backends:**
+
+| | PostgreSQL (`NewPostgresScheduler`) | NATS JetStream (`NewNATSScheduler`) |
+|---|---|---|
+| Infrastructure | A PostgreSQL database | NATS Server 2.12+ with JetStream |
+| Triggering | Poll-bounded claims (default 1s) | JetStream delivers at scheduled time |
+| Failover | Lease expiry (default 5m) | AckWait redelivery + reconciler |
+| Delivery | At-least-once | At-least-once |
+| Best when | You already run PostgreSQL | You already run NATS |
+
+**Configuration options:**
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `WithPostgresPollInterval` | `1s` | Idle poll interval; bounds pickup latency for jobs added by other instances |
+| `WithPostgresLeaseDuration` | `5m` | Claim lease lifetime; bounds crash takeover latency and the double-execution window |
+| `WithPostgresMaxConcurrentExecutions` | `32` | In-flight handlers per instance; surplus due jobs stay claimable by peers |
+| `WithPostgresExecRecordTTL` | `0` (keep forever) | Prune execution records older than the TTL |
+| `WithPostgresSchedulerLogger` | none | Structured logger for background errors |
 
 ## Storage Migration
 
