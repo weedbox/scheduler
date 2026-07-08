@@ -2,9 +2,36 @@ package scheduler
 
 import (
 	"context"
+	"errors"
+	"strconv"
 	"sync"
 	"time"
 )
+
+// SchedulerLogger receives structured error events from the ticker-based
+// scheduler. Same shape as NATSSchedulerLogger.
+type SchedulerLogger func(msg string, keysAndValues ...any)
+
+// SchedulerOption configures a Scheduler created by NewScheduler.
+type SchedulerOption func(*schedulerImpl)
+
+// WithCheckInterval sets how often the scheduler polls for due jobs.
+// Defaults to one second; the interval bounds how late a job can fire.
+func WithCheckInterval(interval time.Duration) SchedulerOption {
+	return func(s *schedulerImpl) {
+		if interval > 0 {
+			s.interval = interval
+		}
+	}
+}
+
+// WithSchedulerLogger installs a logger for background errors (storage
+// write failures, handler panics) that previously vanished silently.
+func WithSchedulerLogger(logger SchedulerLogger) SchedulerOption {
+	return func(s *schedulerImpl) {
+		s.logger = logger
+	}
+}
 
 // schedulerImpl is the concrete implementation of the Scheduler interface
 type schedulerImpl struct {
@@ -20,11 +47,18 @@ type schedulerImpl struct {
 	startReady chan struct{}
 	ticker     *time.Ticker
 	interval   time.Duration
+	logger     SchedulerLogger
 }
 
-// NewScheduler creates a new Scheduler instance
-func NewScheduler(storage Storage, handler JobHandler, codec ScheduleCodec) Scheduler {
-	return &schedulerImpl{
+// NewScheduler creates a new Scheduler instance.
+//
+// This ticker-based scheduler has no cross-instance coordination: multiple
+// instances sharing the same storage (e.g. one GORM database) will each fire
+// every job independently. For multi-instance deployments use
+// NewNATSScheduler, or ensure only one instance runs (leader election is the
+// caller's responsibility).
+func NewScheduler(storage Storage, handler JobHandler, codec ScheduleCodec, opts ...SchedulerOption) Scheduler {
+	s := &schedulerImpl{
 		jobs:       make(map[string]*jobImpl),
 		storage:    storage,
 		handler:    handler,
@@ -32,6 +66,23 @@ func NewScheduler(storage Storage, handler JobHandler, codec ScheduleCodec) Sche
 		interval:   time.Second, // Default check interval
 		startReady: make(chan struct{}),
 	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
+}
+
+// logError forwards a structured error event to the configured logger.
+// Safe to call from any goroutine; no-op when no logger is installed.
+func (s *schedulerImpl) logError(msg string, keysAndValues ...any) {
+	if s.logger == nil {
+		return
+	}
+	defer func() {
+		// A panicking logger must not crash a scheduler goroutine.
+		_ = recover()
+	}()
+	s.logger(msg, keysAndValues...)
 }
 
 // Start begins the scheduler execution
@@ -55,6 +106,13 @@ func (s *schedulerImpl) Start(ctx context.Context) error {
 
 		// Load jobs from storage
 		if err := s.loadJobsFromStorage(ctx); err != nil {
+			return err
+		}
+
+		// Jobs added via AddJob before Start existed only in memory: AddJob
+		// skips the storage write when the scheduler is not yet running.
+		// Persist them now, or a restart would silently lose them.
+		if err := s.persistPreStartJobs(ctx); err != nil {
 			return err
 		}
 	}
@@ -93,11 +151,15 @@ func (s *schedulerImpl) Stop(ctx context.Context) error {
 
 	s.mu.Unlock()
 
-	// Wait for scheduler loop to finish
-	<-s.stopCh
-
-	// Wait for all running jobs to complete
-	s.waitForJobs()
+	// Wait for scheduler loop to finish, bounded by the caller's ctx.
+	var stopErr error
+	select {
+	case <-s.stopCh:
+		// Wait for all running jobs to complete
+		stopErr = s.waitForJobs(ctx)
+	case <-ctx.Done():
+		stopErr = ctx.Err()
+	}
 
 	s.mu.Lock()
 	// Close storage if provided
@@ -111,7 +173,7 @@ func (s *schedulerImpl) Stop(ctx context.Context) error {
 	s.running = false
 	s.startReady = make(chan struct{})
 	s.mu.Unlock()
-	return nil
+	return stopErr
 }
 
 // AddJob registers a new job with the scheduler
@@ -403,10 +465,18 @@ func (s *schedulerImpl) checkAndRunJobs() {
 
 // executeJob executes a single job
 func (s *schedulerImpl) executeJob(job *jobImpl) {
-	// Panic recovery: ensure job.running is reset so the job won't be stuck forever
+	// Panic recovery: ensure job.running is reset so the job won't be stuck
+	// forever. The schedule must also be advanced — a panicking handler skips
+	// the normal lastRun/nextRun update below, and leaving nextRun in the
+	// past would make the ticker re-fire the job every check interval in a
+	// tight loop.
 	defer func() {
 		if r := recover(); r != nil {
+			s.logError("panic during job execution", "job_id", job.id, "panic", r)
+			now := time.Now()
 			job.mu.Lock()
+			job.lastRun = now
+			job.nextRun = job.schedule.Next(now)
 			job.running = false
 			job.mu.Unlock()
 		}
@@ -421,7 +491,10 @@ func (s *schedulerImpl) executeJob(job *jobImpl) {
 	job.mu.Unlock()
 
 	startTime := time.Now()
-	executionID := job.id + "_" + startTime.Format("20060102150405")
+	// Nanosecond precision: a second-resolution timestamp would collide for
+	// jobs firing more than once per second, silently overwriting execution
+	// records.
+	executionID := job.id + "_" + strconv.FormatInt(startTime.UnixNano(), 10)
 	scheduleType, scheduleConfig, hasSchedule := s.encodeSchedule(job.schedule)
 
 	job.mu.RLock()
@@ -445,7 +518,9 @@ func (s *schedulerImpl) executeJob(job *jobImpl) {
 			jobData.ScheduleType = scheduleType
 			jobData.ScheduleConfig = scheduleConfig
 		}
-		s.storage.UpdateJob(s.ctx, jobData)
+		if err := s.storage.UpdateJob(s.ctx, jobData); err != nil {
+			s.logError("failed to persist running status", "job_id", job.id, "err", err)
+		}
 	}
 
 	// Execute job function
@@ -485,7 +560,10 @@ func (s *schedulerImpl) executeJob(job *jobImpl) {
 			Error:       errorMsg,
 			Metadata:    copyMetadata(job.metadata),
 		}
-		s.storage.SaveExecution(s.ctx, record)
+		if err := s.storage.SaveExecution(s.ctx, record); err != nil {
+			s.logError("failed to persist execution record",
+				"job_id", job.id, "execution_id", executionID, "err", err)
+		}
 
 		job.mu.RLock()
 		updatedNextRun := job.nextRun
@@ -506,7 +584,9 @@ func (s *schedulerImpl) executeJob(job *jobImpl) {
 			jobData.ScheduleType = scheduleType
 			jobData.ScheduleConfig = scheduleConfig
 		}
-		s.storage.UpdateJob(s.ctx, jobData)
+		if err := s.storage.UpdateJob(s.ctx, jobData); err != nil {
+			s.logError("failed to persist job state", "job_id", job.id, "err", err)
+		}
 	}
 }
 
@@ -552,8 +632,48 @@ func (s *schedulerImpl) loadJobsFromStorage(ctx context.Context) error {
 	return nil
 }
 
-// waitForJobs waits for all running jobs to complete
-func (s *schedulerImpl) waitForJobs() {
+// persistPreStartJobs saves jobs registered via AddJob before Start() to
+// storage. Called from Start with s.mu held, after loadJobsFromStorage has
+// merged persisted jobs into s.jobs; any job already present in storage is
+// left untouched (the in-memory copy shadows it for this process).
+func (s *schedulerImpl) persistPreStartJobs(ctx context.Context) error {
+	now := time.Now()
+	for id, job := range s.jobs {
+		if _, err := s.storage.GetJob(ctx, id); err == nil {
+			continue
+		} else if !errors.Is(err, ErrJobDataNotFound) {
+			return err
+		}
+
+		var scheduleType, scheduleConfig string
+		if s.codec != nil {
+			var err error
+			scheduleType, scheduleConfig, err = s.codec.Encode(job.schedule)
+			if err != nil {
+				return err
+			}
+		}
+
+		jobData := &JobData{
+			ID:             id,
+			Status:         JobStatusPending,
+			NextRun:        job.nextRun,
+			LastRun:        job.lastRun,
+			CreatedAt:      job.createdAt,
+			UpdatedAt:      now,
+			ScheduleType:   scheduleType,
+			ScheduleConfig: scheduleConfig,
+			Metadata:       copyMetadata(job.metadata),
+		}
+		if err := s.storage.SaveJob(ctx, jobData); err != nil && !errors.Is(err, ErrJobDataAlreadyExists) {
+			return err
+		}
+	}
+	return nil
+}
+
+// waitForJobs waits for all running jobs to complete, bounded by ctx.
+func (s *schedulerImpl) waitForJobs(ctx context.Context) error {
 	for {
 		s.mu.RLock()
 		hasRunning := false
@@ -566,10 +686,14 @@ func (s *schedulerImpl) waitForJobs() {
 		s.mu.RUnlock()
 
 		if !hasRunning {
-			break
+			return nil
 		}
 
-		time.Sleep(100 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
 	}
 }
 
