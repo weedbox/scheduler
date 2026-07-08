@@ -13,6 +13,7 @@ const (
 	scheduleTypeOnce                  = "once"
 	scheduleTypeStartAtInterval       = "start_at_interval"
 	scheduleTypeCron                  = "cron"
+	scheduleTypeDaily                 = "daily"
 	farFutureYears              int64 = 100
 )
 
@@ -91,12 +92,7 @@ func (s *StartAtIntervalSchedule) Next(t time.Time) time.Time {
 		return s.startAt
 	}
 
-	elapsed := t.Sub(s.startAt)
-	cycles := elapsed / s.interval
-	if elapsed%s.interval == 0 {
-		return s.startAt.Add((cycles + 1) * s.interval)
-	}
-
+	cycles := t.Sub(s.startAt) / s.interval
 	return s.startAt.Add((cycles + 1) * s.interval)
 }
 
@@ -110,8 +106,47 @@ func (s *StartAtIntervalSchedule) Interval() time.Duration {
 	return s.interval
 }
 
+// DailySchedule runs a job every day at a fixed wall-clock time, evaluated
+// in the location of the reference time passed to Next (typically the
+// scheduler host's local time zone).
+type DailySchedule struct {
+	hour   int
+	minute int
+	second int
+}
+
+// NewDailySchedule creates a schedule that fires once per day at the given
+// wall-clock time.
+func NewDailySchedule(hour, minute, second int) (*DailySchedule, error) {
+	if hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 59 {
+		return nil, ErrInvalidScheduleTime
+	}
+	return &DailySchedule{hour: hour, minute: minute, second: second}, nil
+}
+
+// Next returns the next occurrence of the configured wall-clock time strictly
+// after t.
+func (s *DailySchedule) Next(t time.Time) time.Time {
+	next := time.Date(t.Year(), t.Month(), t.Day(), s.hour, s.minute, s.second, 0, t.Location())
+	if !next.After(t) {
+		next = next.AddDate(0, 0, 1)
+	}
+	return next
+}
+
+// At returns the configured hour, minute, and second.
+func (s *DailySchedule) At() (hour, minute, second int) {
+	return s.hour, s.minute, s.second
+}
+
 // CronSchedule runs a job based on a cron expression.
 // Supports standard cron format: minute hour day month weekday
+//
+// Times are evaluated in the location of the reference time passed to Next —
+// in practice the scheduler host's local time zone. A cluster whose nodes run
+// in different time zones will disagree on when "0 10 * * *" fires; pin the
+// hosts (or container TZ) to a common zone if that matters.
+//
 // Examples:
 //   - "0 10 * * 5" - Every Friday at 10:00 AM
 //   - "30 14 * * *" - Every day at 2:30 PM
@@ -252,6 +287,9 @@ func (c *BasicScheduleCodec) Encode(schedule Schedule) (string, string, error) {
 		return scheduleTypeStartAtInterval, config, nil
 	case *CronSchedule:
 		return scheduleTypeCron, s.Expression(), nil
+	case *DailySchedule:
+		hour, minute, second := s.At()
+		return scheduleTypeDaily, fmt.Sprintf("%02d:%02d:%02d", hour, minute, second), nil
 	default:
 		return "", "", fmt.Errorf("unsupported schedule type %T", schedule)
 	}
@@ -297,6 +335,12 @@ func (c *BasicScheduleCodec) Decode(scheduleType string, scheduleConfig string) 
 			return nil, ErrInvalidScheduleConfig
 		}
 		return NewCronSchedule(scheduleConfig)
+	case scheduleTypeDaily:
+		var hour, minute, second int
+		if _, err := fmt.Sscanf(scheduleConfig, "%d:%d:%d", &hour, &minute, &second); err != nil {
+			return nil, ErrInvalidScheduleConfig
+		}
+		return NewDailySchedule(hour, minute, second)
 	default:
 		return nil, fmt.Errorf("unsupported schedule type %s", scheduleType)
 	}
@@ -305,4 +349,33 @@ func (c *BasicScheduleCodec) Decode(scheduleType string, scheduleConfig string) 
 func farFutureTime(from time.Time) time.Time {
 	loc := from.Location()
 	return time.Date(from.Year()+int(farFutureYears), time.January, 1, 0, 0, 0, 0, loc)
+}
+
+// scheduleBuilder is the built-in ScheduleBuilder implementation.
+type scheduleBuilder struct{}
+
+// NewScheduleBuilder returns a ScheduleBuilder that creates the built-in
+// schedule types, all of which round-trip through BasicScheduleCodec.
+func NewScheduleBuilder() ScheduleBuilder {
+	return &scheduleBuilder{}
+}
+
+// Every creates a schedule that runs at fixed intervals.
+func (b *scheduleBuilder) Every(duration time.Duration) (Schedule, error) {
+	return NewIntervalSchedule(duration)
+}
+
+// Cron creates a schedule from a cron expression.
+func (b *scheduleBuilder) Cron(expression string) (Schedule, error) {
+	return NewCronSchedule(expression)
+}
+
+// At creates a schedule that runs daily at the given wall-clock time.
+func (b *scheduleBuilder) At(hour, minute, second int) (Schedule, error) {
+	return NewDailySchedule(hour, minute, second)
+}
+
+// Once creates a schedule that runs only once at the specified time.
+func (b *scheduleBuilder) Once(t time.Time) (Schedule, error) {
+	return NewOnceSchedule(t)
 }
