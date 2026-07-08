@@ -3,6 +3,7 @@ package scheduler
 import (
 	"context"
 	"errors"
+	"sort"
 	"sync"
 	"time"
 )
@@ -341,10 +342,17 @@ func (s *MemoryStorage) ListExecutions(ctx context.Context, jobID string, option
 		records = append(records, &recordCopy)
 	}
 
-	// Apply sorting
-	if options != nil && options.SortBy != "" {
-		s.sortExecutions(records, options.SortBy, options.SortDesc)
+	// Apply sorting — default start_time ascending so every backend returns
+	// the same order.
+	sortBy := "start_time"
+	sortDesc := false
+	if options != nil {
+		if options.SortBy != "" {
+			sortBy = options.SortBy
+		}
+		sortDesc = options.SortDesc
 	}
+	s.sortExecutions(records, sortBy, sortDesc)
 
 	// Apply pagination
 	if options != nil {
@@ -366,41 +374,24 @@ func (s *MemoryStorage) ListExecutions(ctx context.Context, jobID string, option
 	return records, nil
 }
 
-// sortExecutions sorts execution records based on the specified field
+// sortExecutions sorts execution records based on the specified field.
+// Unknown fields sort by start_time, matching the other backends.
 func (s *MemoryStorage) sortExecutions(records []*ExecutionRecord, sortBy string, descending bool) {
-	// Simple bubble sort implementation for demonstration
-	// In production, consider using sort.Slice for better performance
-	n := len(records)
-	for i := 0; i < n-1; i++ {
-		for j := 0; j < n-i-1; j++ {
-			shouldSwap := false
-
-			switch sortBy {
-			case "start_time":
-				if descending {
-					shouldSwap = records[j].StartTime.Before(records[j+1].StartTime)
-				} else {
-					shouldSwap = records[j].StartTime.After(records[j+1].StartTime)
-				}
-			case "duration":
-				if descending {
-					shouldSwap = records[j].Duration < records[j+1].Duration
-				} else {
-					shouldSwap = records[j].Duration > records[j+1].Duration
-				}
-			case "end_time":
-				if descending {
-					shouldSwap = records[j].EndTime.Before(records[j+1].EndTime)
-				} else {
-					shouldSwap = records[j].EndTime.After(records[j+1].EndTime)
-				}
-			}
-
-			if shouldSwap {
-				records[j], records[j+1] = records[j+1], records[j]
-			}
+	sort.SliceStable(records, func(i, j int) bool {
+		var less bool
+		switch sortBy {
+		case "duration":
+			less = records[i].Duration < records[j].Duration
+		case "end_time":
+			less = records[i].EndTime.Before(records[j].EndTime)
+		default:
+			less = records[i].StartTime.Before(records[j].StartTime)
 		}
-	}
+		if descending {
+			return !less
+		}
+		return less
+	})
 }
 
 // DeleteExecutions removes execution records older than the specified time

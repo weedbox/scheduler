@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"time"
 
 	"gorm.io/gorm"
@@ -13,6 +14,52 @@ import (
 type GormStorage struct {
 	db          *gorm.DB
 	initialized bool
+
+	// ownsDB controls whether Close() closes the underlying *sql.DB
+	// connection pool. The *gorm.DB is injected by the caller and is
+	// commonly shared with the rest of the application, so the default is
+	// false; opt in with WithGormOwnsDB when the storage is the sole user.
+	ownsDB bool
+}
+
+// executionSortColumns whitelists ListExecutions SortBy values, mapping each
+// to the column it sorts on. Only values present here may reach the ORDER BY
+// clause.
+var executionSortColumns = map[string]string{
+	"start_time": "start_time",
+	"end_time":   "end_time",
+	"duration":   "duration",
+}
+
+// isDuplicateKeyErr recognizes primary-key violations across SQL drivers.
+// SaveJob's existence pre-check is check-then-act: two concurrent writers can
+// both pass the check, and the loser's Create then fails with a
+// driver-specific duplicate-key error that must map to
+// ErrJobDataAlreadyExists rather than leak through raw.
+func isDuplicateKeyErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, gorm.ErrDuplicatedKey) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "UNIQUE constraint failed") || // sqlite
+		strings.Contains(msg, "duplicate key value") || // postgres
+		strings.Contains(msg, "Duplicate entry") // mysql
+}
+
+// GormStorageOption configures a GormStorage created by NewGormStorage.
+type GormStorageOption func(*GormStorage)
+
+// WithGormOwnsDB makes Close() close the underlying *sql.DB connection pool.
+// Use this only when the *gorm.DB was created exclusively for this storage;
+// closing a pool shared with the rest of the application would break every
+// other user of that DB (Scheduler.Stop calls Storage.Close).
+func WithGormOwnsDB() GormStorageOption {
+	return func(s *GormStorage) {
+		s.ownsDB = true
+	}
 }
 
 // JobDataModel represents the database model for JobData
@@ -50,12 +97,18 @@ func (ExecutionRecordModel) TableName() string {
 	return "scheduler_executions"
 }
 
-// NewGormStorage creates a new GORM storage instance
-func NewGormStorage(db *gorm.DB) *GormStorage {
-	return &GormStorage{
+// NewGormStorage creates a new GORM storage instance. By default Close()
+// does NOT close the injected *gorm.DB's connection pool (it is usually
+// shared with the application); pass WithGormOwnsDB to transfer ownership.
+func NewGormStorage(db *gorm.DB, opts ...GormStorageOption) *GormStorage {
+	s := &GormStorage{
 		db:          db,
 		initialized: false,
 	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 // Initialize prepares the storage for use
@@ -78,21 +131,22 @@ func (s *GormStorage) Initialize(ctx context.Context) error {
 	return nil
 }
 
-// Close releases storage resources
+// Close releases storage resources. The underlying *sql.DB connection pool
+// is closed only when the storage owns it (see WithGormOwnsDB) — by default
+// the pool belongs to the caller and stays open.
 func (s *GormStorage) Close(ctx context.Context) error {
 	if !s.initialized {
 		return ErrStorageNotInitialized
 	}
 
-	// Get underlying SQL database
-	sqlDB, err := s.db.DB()
-	if err != nil {
-		return err
-	}
-
-	// Close the connection
-	if err := sqlDB.Close(); err != nil {
-		return err
+	if s.ownsDB {
+		sqlDB, err := s.db.DB()
+		if err != nil {
+			return err
+		}
+		if err := sqlDB.Close(); err != nil {
+			return err
+		}
 	}
 
 	s.initialized = false
@@ -131,6 +185,9 @@ func (s *GormStorage) SaveJob(ctx context.Context, job *JobData) error {
 
 	// Save to database
 	if err := s.db.WithContext(ctx).Create(model).Error; err != nil {
+		if isDuplicateKeyErr(err) {
+			return ErrJobDataAlreadyExists
+		}
 		return err
 	}
 
@@ -363,19 +420,28 @@ func (s *GormStorage) ListExecutions(ctx context.Context, jobID string, options 
 		if options.Status != nil {
 			query = query.Where("status = ?", string(*options.Status))
 		}
+	}
 
-		// Apply sorting
-		if options.SortBy != "" {
-			orderClause := options.SortBy
-			if options.SortDesc {
-				orderClause += " DESC"
-			} else {
-				orderClause += " ASC"
-			}
-			query = query.Order(orderClause)
+	// Apply sorting — always ordered so results are deterministic and match
+	// the other backends. SortBy must be mapped through the whitelist: it
+	// lands verbatim in the ORDER BY clause, so an unlisted value would be a
+	// SQL injection vector. Unknown or empty values fall back to start_time.
+	sortColumn := "start_time"
+	sortDesc := false
+	if options != nil {
+		if column, ok := executionSortColumns[options.SortBy]; ok {
+			sortColumn = column
 		}
+		sortDesc = options.SortDesc
+	}
+	if sortDesc {
+		query = query.Order(sortColumn + " DESC")
+	} else {
+		query = query.Order(sortColumn + " ASC")
+	}
 
-		// Apply pagination
+	// Apply pagination
+	if options != nil {
 		if options.Offset > 0 {
 			query = query.Offset(options.Offset)
 		}

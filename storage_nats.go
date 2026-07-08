@@ -65,6 +65,19 @@ func WithNATSStorageJetStreamReadyTimeout(timeout time.Duration) NATSStorageOpti
 	}
 }
 
+// WithNATSStorageExecRecordTTL sets a per-key TTL on the execution-record KV
+// bucket so old execution records age out automatically. Without it the exec
+// bucket grows without bound (one key per execution, forever). Zero (the
+// default) keeps records indefinitely.
+func WithNATSStorageExecRecordTTL(ttl time.Duration) NATSStorageOption {
+	return func(s *NATSStorage) {
+		if ttl < 0 {
+			ttl = 0
+		}
+		s.execRecordTTL = ttl
+	}
+}
+
 // NATSStorage implements the Storage interface using NATS JetStream KV Store.
 type NATSStorage struct {
 	js                    jetstream.JetStream
@@ -73,6 +86,7 @@ type NATSStorage struct {
 	jobBucket             string
 	execBucket            string
 	jetStreamReadyTimeout time.Duration
+	execRecordTTL         time.Duration
 	initialized           bool
 }
 
@@ -80,8 +94,8 @@ type NATSStorage struct {
 func NewNATSStorage(js jetstream.JetStream, opts ...NATSStorageOption) *NATSStorage {
 	s := &NATSStorage{
 		js:                    js,
-		jobBucket:             "SCHEDULER_JOBS",
-		execBucket:            "SCHEDULER_EXECUTIONS",
+		jobBucket:             defaultNATSJobBucket,
+		execBucket:            defaultNATSExecBucket,
 		jetStreamReadyTimeout: defaultJetStreamReadyTimeout,
 	}
 	for _, opt := range opts {
@@ -119,6 +133,7 @@ func (s *NATSStorage) Initialize(ctx context.Context) error {
 
 	execKV, err := EnsureKVConvergent(ctx, s.js, jetstream.KeyValueConfig{
 		Bucket: s.execBucket,
+		TTL:    s.execRecordTTL,
 	}, nil)
 	if err != nil {
 		return fmt.Errorf("%w: failed to create exec KV bucket: %v", ErrStorageConnectionFailed, err)
