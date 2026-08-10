@@ -1064,6 +1064,45 @@ func (s *natsSchedulerImpl) GetJob(id string) (Job, error) {
 	return job, nil
 }
 
+// HasJob reports whether a job with this ID exists in KV, which is the shared
+// source of truth across every peer.
+//
+// GetJob cannot be used for this. It answers from s.jobs, a per-process cache
+// seeded from KV at Start and afterwards filled in only as messages arrive, so
+// it reports absent for a job a peer registered after this instance started.
+// Callers that use "absent" as licence to register a replacement under a fresh
+// ID would then run two live chains for one logical job — no ID collision to
+// stop them, since the replacement's key differs.
+//
+// A local cache hit is proof enough and skips the round trip; only a miss has
+// to ask KV. Before Start, or with no KV wired, there is nothing shared to
+// consult and the cache is the only available answer.
+func (s *natsSchedulerImpl) HasJob(id string) (bool, error) {
+	if id == "" {
+		return false, ErrEmptyJobID
+	}
+
+	s.mu.RLock()
+	_, exists := s.jobs[id]
+	running, kv := s.running, s.jobKV
+	s.mu.RUnlock()
+
+	if exists {
+		return true, nil
+	}
+	if !running || kv == nil {
+		return false, nil
+	}
+
+	if _, err := kv.Get(s.ctx, id); err != nil {
+		if errors.Is(err, jetstream.ErrKeyNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
 // ListJobs returns all registered jobs.
 func (s *natsSchedulerImpl) ListJobs() []Job {
 	s.mu.RLock()

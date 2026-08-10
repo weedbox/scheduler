@@ -386,6 +386,24 @@ func (s *schedulerImpl) GetJob(id string) (Job, error) {
 	return job, nil
 }
 
+// HasJob reports whether a job with this ID is registered.
+//
+// This scheduler is in-process by construction — no shared store, no peers — so
+// the local map is the whole world and the answer is always exact. The error
+// return exists for the interface, whose other backends can genuinely fail to
+// tell.
+func (s *schedulerImpl) HasJob(id string) (bool, error) {
+	if id == "" {
+		return false, ErrEmptyJobID
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	_, exists := s.jobs[id]
+	return exists, nil
+}
+
 // ListJobs returns all registered jobs
 func (s *schedulerImpl) ListJobs() []Job {
 	s.mu.RLock()

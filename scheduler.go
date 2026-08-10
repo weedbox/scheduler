@@ -173,6 +173,23 @@ type Scheduler interface {
 	// GetJob retrieves a job by its ID
 	GetJob(id string) (Job, error)
 
+	// HasJob reports whether a job with this ID exists anywhere the scheduler
+	// shares state, not merely on this instance.
+	//
+	// It exists because GetJob cannot answer that question uniformly. The NATS
+	// backend keeps a per-process cache — seeded from KV at Start, then filled
+	// in only as messages arrive — so its GetJob returns ErrJobNotFound for a
+	// job another peer registered after this one started, even though that job
+	// is registered and firing. A caller that reads it as "nothing is
+	// scheduled" and registers a replacement under a fresh ID ends up with two
+	// live chains for one logical job. HasJob consults the shared store, so
+	// false means absent everywhere.
+	//
+	// The error is deliberately not folded into the bool: "cannot tell" is not
+	// "no", and only the caller knows which way to fail when the store is
+	// unreachable.
+	HasJob(id string) (bool, error)
+
 	// ListJobs returns all registered jobs
 	ListJobs() []Job
 
