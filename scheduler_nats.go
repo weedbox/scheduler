@@ -962,6 +962,26 @@ func (s *natsSchedulerImpl) UpdateJobSchedule(id string, schedule Schedule) erro
 }
 
 // RemoveJob removes a job from the scheduler, purges its scheduled messages, and deletes it from KV.
+//
+// Removal is cluster-wide, not instance-local. s.jobs is only a cache — it is
+// seeded from KV at Start and afterwards filled in lazily by handleMessage — so
+// a job another peer added after this peer started is absent here while very
+// much alive there. This used to return ErrJobNotFound on that miss and stop,
+// touching neither KV nor the stream, which made the removal a no-op: the job
+// kept firing on its owning peer, and a caller that took the error at face
+// value ("nothing to remove") would drop its own record of a live job. KV is
+// the authority, so absence from the local cache is not evidence of anything
+// and the KV row decides.
+//
+// Purging KV is what actually stops a job owned elsewhere. Its peer re-reads
+// KV after every execution and, finding the row gone, drops its cache entry and
+// skips the next-tick publish (see executeJob's post-handler CAS), so the chain
+// dies on its own. Purging the subject as well means an already-queued tick
+// does not get one last run in first.
+//
+// Purge failures are now returned rather than discarded. A caller deleting its
+// own record of the job needs to know the job outlived the request; swallowing
+// that is how a live job loses its last reference.
 func (s *natsSchedulerImpl) RemoveJob(id string) error {
 	if id == "" {
 		return ErrEmptyJobID
@@ -971,26 +991,58 @@ func (s *natsSchedulerImpl) RemoveJob(id string) error {
 	defer s.mu.Unlock()
 
 	job, exists := s.jobs[id]
+	if exists {
+		// Wait for job to complete if running. Only possible for a locally
+		// cached job — an execution on another peer is not ours to wait for,
+		// and does not need to be: the KV purge below converges it.
+		for job.IsRunning() {
+			s.mu.Unlock()
+			time.Sleep(100 * time.Millisecond)
+			s.mu.Lock()
+		}
+
+		delete(s.jobs, id)
+	}
+
+	// Stopped, or no KV to consult: the shared state is out of reach, so the
+	// local cache is all there is to answer from.
+	if !s.running || s.jobKV == nil {
+		if !exists {
+			return ErrJobNotFound
+		}
+		return nil
+	}
+
 	if !exists {
-		return ErrJobNotFound
+		// Not ours — before purging on behalf of another peer, confirm the job
+		// exists at all. This is the only place ErrJobNotFound can now be
+		// decided from evidence rather than from a cache miss.
+		if _, err := s.jobKV.Get(s.ctx, id); err != nil {
+			if errors.Is(err, jetstream.ErrKeyNotFound) {
+				return ErrJobNotFound
+			}
+			return err
+		}
 	}
 
-	// Wait for job to complete if running
-	for job.IsRunning() {
-		s.mu.Unlock()
-		time.Sleep(100 * time.Millisecond)
-		s.mu.Lock()
+	// Purge scheduled messages for this job. Best-effort on purpose: with the
+	// KV row gone, a surviving tick is dropped by handleMessage (its lazy load
+	// fails) or converged by the post-handler CAS on the peer that has it
+	// cached. Failing the whole removal over it would ask callers to retry
+	// something already effectively done.
+	subject := s.jobSubject(id)
+	if err := s.stream.Purge(s.ctx, jetstream.WithPurgeSubject(subject)); err != nil {
+		s.logError("failed to purge scheduled messages for removed job",
+			"job_id", id, "subject", subject, "err", err)
 	}
 
-	delete(s.jobs, id)
-
-	if s.running {
-		// Purge scheduled messages for this job
-		subject := s.jobSubject(id)
-		_ = s.stream.Purge(s.ctx, jetstream.WithPurgeSubject(subject))
-
-		// Delete job metadata from KV
-		_ = s.jobKV.Purge(s.ctx, id)
+	// Delete job metadata from KV. This one decides the outcome: while the row
+	// stands, every peer can still load and run the job.
+	if err := s.jobKV.Purge(s.ctx, id); err != nil {
+		if errors.Is(err, jetstream.ErrKeyNotFound) {
+			return nil
+		}
+		return err
 	}
 
 	return nil
