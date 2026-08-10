@@ -578,6 +578,34 @@ func (s *postgresSchedulerImpl) GetJob(id string) (Job, error) {
 	return s.jobFromData(jobData), nil
 }
 
+// HasJob reports whether a job with this ID exists in shared storage.
+//
+// Unlike the NATS backend, this one's GetJob already reads storage rather than
+// a cache, so HasJob is the same question minus the decode. Before Start there
+// is no shared storage yet and the pre-start set is the only thing to answer
+// from.
+func (s *postgresSchedulerImpl) HasJob(id string) (bool, error) {
+	if id == "" {
+		return false, ErrEmptyJobID
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if !s.running {
+		_, exists := s.preStartJobs[id]
+		return exists, nil
+	}
+
+	if _, err := s.storage.GetJob(s.ctx, id); err != nil {
+		if errors.Is(err, ErrJobDataNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
 // ListJobs returns all registered jobs
 func (s *postgresSchedulerImpl) ListJobs() []Job {
 	s.mu.RLock()
