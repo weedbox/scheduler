@@ -425,9 +425,16 @@ func WithMaxConcurrentExecutions(n int) NATSSchedulerOption {
 // for triggering jobs, and JetStream KV Store for persisting job metadata
 // and execution records.
 type natsSchedulerImpl struct {
-	mu         sync.RWMutex
-	running    bool
-	jobs       map[string]*jobImpl
+	mu      sync.RWMutex
+	running bool
+	jobs    map[string]*jobImpl
+	// removing counts in-flight RemoveJob calls per job id. A removal drops
+	// the cache entry and then purges KV without holding mu, so a concurrent
+	// handleMessage that read KV just before the purge would otherwise
+	// resurrect the entry that was just deleted. While the count is non-zero
+	// the lazy-load path refuses to re-insert. Counted, not a bare set, so
+	// concurrent removals of the same id cannot clear each other's guard.
+	removing   map[string]int
 	handler    JobHandler
 	codec      ScheduleCodec
 	js         jetstream.JetStream
@@ -505,6 +512,7 @@ type natsSchedulerImpl struct {
 func NewNATSScheduler(js jetstream.JetStream, handler JobHandler, opts ...NATSSchedulerOption) Scheduler {
 	s := &natsSchedulerImpl{
 		jobs:                  make(map[string]*jobImpl),
+		removing:              make(map[string]int),
 		handler:               handler,
 		codec:                 NewBasicScheduleCodec(),
 		js:                    js,
@@ -987,9 +995,19 @@ func (s *natsSchedulerImpl) RemoveJob(id string) error {
 		return ErrEmptyJobID
 	}
 
+	// The lock covers the cache mutation only. Everything past it is a NATS
+	// round-trip, and holding mu across those lets one unreachable server
+	// stall every other scheduler operation — including the handlers that
+	// need mu to record a completed run. HasJob draws the line in the same
+	// place.
+	//
+	// The removing guard is what makes releasing it safe: a concurrent
+	// handleMessage that read this job from KV before the purge would
+	// otherwise put it straight back into the cache. Releasing mu widens that
+	// window but does not create it — under the old always-locked version the
+	// lazy load simply blocked on mu and re-inserted the moment RemoveJob
+	// returned.
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	job, exists := s.jobs[id]
 	if exists {
 		// Wait for job to complete if running. Only possible for a locally
@@ -1003,10 +1021,29 @@ func (s *natsSchedulerImpl) RemoveJob(id string) error {
 
 		delete(s.jobs, id)
 	}
+	s.removing[id]++
+	running, kv, stream := s.running, s.jobKV, s.stream
+	s.mu.Unlock()
+
+	// Lowering the guard is all this has to do. There is no second delete to
+	// make: raising the guard and dropping the cache entry happen in one
+	// critical section, so a lazy load either got the lock first (and its entry
+	// was deleted just now) or gets it after (and the guard turns it away).
+	// Measured — keeping a re-delete here changed no test, and it would have
+	// clobbered the cache entry of a concurrent AddJob that reused the id.
+	defer func() {
+		s.mu.Lock()
+		if s.removing[id] <= 1 {
+			delete(s.removing, id)
+		} else {
+			s.removing[id]--
+		}
+		s.mu.Unlock()
+	}()
 
 	// Stopped, or no KV to consult: the shared state is out of reach, so the
 	// local cache is all there is to answer from.
-	if !s.running || s.jobKV == nil {
+	if !running || kv == nil {
 		if !exists {
 			return ErrJobNotFound
 		}
@@ -1017,7 +1054,7 @@ func (s *natsSchedulerImpl) RemoveJob(id string) error {
 		// Not ours — before purging on behalf of another peer, confirm the job
 		// exists at all. This is the only place ErrJobNotFound can now be
 		// decided from evidence rather than from a cache miss.
-		if _, err := s.jobKV.Get(s.ctx, id); err != nil {
+		if _, err := kv.Get(s.ctx, id); err != nil {
 			if errors.Is(err, jetstream.ErrKeyNotFound) {
 				return ErrJobNotFound
 			}
@@ -1030,15 +1067,17 @@ func (s *natsSchedulerImpl) RemoveJob(id string) error {
 	// fails) or converged by the post-handler CAS on the peer that has it
 	// cached. Failing the whole removal over it would ask callers to retry
 	// something already effectively done.
-	subject := s.jobSubject(id)
-	if err := s.stream.Purge(s.ctx, jetstream.WithPurgeSubject(subject)); err != nil {
-		s.logError("failed to purge scheduled messages for removed job",
-			"job_id", id, "subject", subject, "err", err)
+	if stream != nil {
+		subject := s.jobSubject(id)
+		if err := stream.Purge(s.ctx, jetstream.WithPurgeSubject(subject)); err != nil {
+			s.logError("failed to purge scheduled messages for removed job",
+				"job_id", id, "subject", subject, "err", err)
+		}
 	}
 
 	// Delete job metadata from KV. This one decides the outcome: while the row
 	// stands, every peer can still load and run the job.
-	if err := s.jobKV.Purge(s.ctx, id); err != nil {
+	if err := kv.Purge(s.ctx, id); err != nil {
 		if errors.Is(err, jetstream.ErrKeyNotFound) {
 			return nil
 		}
@@ -1182,6 +1221,14 @@ func (s *natsSchedulerImpl) handleMessage(msg jetstream.Msg) {
 			return
 		}
 		s.mu.Lock()
+		if s.removing[jobID] > 0 {
+			// A RemoveJob for this id is in flight: the KV row we just read is
+			// on its way out. Caching it would resurrect a job the caller has
+			// been told is gone.
+			s.mu.Unlock()
+			_ = msg.Ack()
+			return
+		}
 		if existing, ok := s.jobs[jobID]; ok {
 			job = existing
 		} else {
