@@ -277,6 +277,7 @@ type Scheduler interface {
     UpdateJobSchedule(id string, schedule Schedule) error
     RemoveJob(id string) error
     GetJob(id string) (Job, error)
+    HasJob(id string) (bool, error)
     ListJobs() []Job
     IsRunning() bool
 }
@@ -294,6 +295,12 @@ if err := sched.UpdateJobSchedule("my-job", newSchedule); err != nil {
 ```
 
 Directly editing `ScheduleType` or `ScheduleConfig` in storage does not change the in-memory scheduler; always use `UpdateJobSchedule` (or remove/re-add) for runtime updates.
+
+Use `HasJob` — not `GetJob` — to ask whether a job is registered at all. On the NATS
+backend `GetJob` answers from a per-process cache, so it reports `ErrJobNotFound` for a
+job another peer registered after this instance started, even though that job is live
+and firing. `HasJob` consults the shared KV, so `false` means absent everywhere. See
+[HasJob](#hasjob) in the API reference for how to handle its error.
 
 ### Job
 
@@ -501,6 +508,23 @@ NATS_URL=nats://localhost:4222 go run .
 # Terminal 2 — second worker (same consumer group, auto load-balanced)
 NATS_URL=nats://localhost:4222 go run .
 ```
+
+**What each worker knows about the others' jobs.** `s.jobs` is a per-process cache,
+seeded from KV at `Start` and filled in lazily as messages arrive. A job another worker
+registered after this one started is therefore *not* in this worker's cache, and that
+shapes the API:
+
+| Method | Scope |
+|---|---|
+| `AddJob` | Cluster-wide — guarded by a KV `Create`, so a duplicate ID is rejected no matter which worker holds it |
+| `RemoveJob` | Cluster-wide (v0.6.1+) — purges the shared KV row, which stops the chain everywhere |
+| `HasJob` | Cluster-wide (v0.7.0+) — falls back to the shared KV on a cache miss |
+| `GetJob`, `ListJobs` | Instance-local by design — they hand back live `Job` objects, which only exist for jobs this process has |
+| `UpdateJobSchedule` | Instance-local — returns `ErrJobNotFound` for a job this worker has not cached |
+
+The distinction matters most when deciding whether to register something: read
+`GetJob`'s `ErrJobNotFound` as "not here", not as "not scheduled", and use `HasJob` when
+the difference would lead you to create a second job for the same logical work.
 
 **Configuration options:**
 
@@ -929,17 +953,62 @@ Registers a new job with the scheduler.
 ```go
 RemoveJob(id string) error
 ```
-Removes a job from the scheduler. Waits for the job to complete if running.
+Removes a job from the scheduler. Waits for the job to complete if running (only
+possible for a job this instance has cached — an execution on another peer is not
+this instance's to wait for).
+
+On the NATS backend removal is cluster-wide from v0.6.1 on: a job registered by
+another peer is purged from the shared KV, which stops it everywhere. `ErrJobNotFound`
+therefore means *not registered anywhere*, not merely *not cached here*. A failure to
+purge the KV row is returned; a failure to purge pending scheduled messages is logged
+and tolerated, because with the KV row gone a surviving tick is dropped on delivery.
 
 **Errors:**
 - `ErrEmptyJobID`: Job ID is empty
 - `ErrJobNotFound`: Job does not exist
+- Storage errors (NATS backend: a KV lookup or purge that failed for any reason other
+  than the key being absent)
 
 #### GetJob
 ```go
 GetJob(id string) (Job, error)
 ```
-Retrieves a job by its ID.
+Retrieves a job by its ID. Instance-local on the NATS backend: it answers from this
+process's cache, which holds jobs seeded from KV at `Start` plus those seen since. Use
+`HasJob` for an existence check that crosses instances.
+
+#### HasJob
+```go
+HasJob(id string) (bool, error)
+```
+Reports whether a job with this ID exists anywhere the scheduler shares state.
+
+The NATS backend checks its cache first and falls back to the shared KV, so `false`
+means the job is absent cluster-wide. The memory backend answers from its map (it has
+no peers by construction); the PostgreSQL backend reads its storage.
+
+The error is deliberately not folded into the bool: *cannot tell* is not *no*, and only
+the caller knows which way to fail when the store is unreachable. A caller that treats
+an error as "nothing is scheduled" and registers a replacement can end up with two live
+chains for one logical job.
+
+```go
+has, err := sched.HasJob("my-job")
+if err != nil {
+    // cannot tell — decide per call site, do not assume false
+}
+if !has && err == nil {
+    _ = sched.AddJob("my-job", schedule, nil)
+}
+```
+
+**Errors:**
+- `ErrEmptyJobID`: Job ID is empty
+- Storage errors (NATS backend: a KV lookup that failed for any reason other than the
+  key being absent)
+
+Returns `(false, nil)` — never an error — when the scheduler is not running and has no
+shared store to consult, since the local cache is then all there is to answer from.
 
 #### ListJobs
 ```go
