@@ -259,7 +259,7 @@ func (s *postgresSchedulerImpl) Start(ctx context.Context) error {
 	}
 
 	// Add the claim-coordination columns to the shared jobs table.
-	if err := s.db.WithContext(ctx).AutoMigrate(&postgresJobModel{}); err != nil {
+	if err := autoMigrate(ctx, s.db, &postgresJobModel{}); err != nil {
 		return err
 	}
 
