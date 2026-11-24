@@ -121,8 +121,8 @@ func (s *GormStorage) Initialize(ctx context.Context) error {
 		return ErrStorageConnectionFailed
 	}
 
-	// Auto-migrate the schema
-	err := s.db.WithContext(ctx).AutoMigrate(&JobDataModel{}, &ExecutionRecordModel{})
+	// Auto-migrate the schema (serialized across instances on PostgreSQL)
+	err := autoMigrate(ctx, s.db, &JobDataModel{}, &ExecutionRecordModel{})
 	if err != nil {
 		return err
 	}
